@@ -1,0 +1,24 @@
+name: Link PR to Athena task
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+jobs:
+  link-pr:
+    name: Add PR link to matching Athena task
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Link PR to Athena task
+        uses: ./.github/actions/sync-athena
+        with:
+          mode: pr_to_comment
+          repo: ${{ github.repository }}
+          ticket_prefix: ${{ vars.ATHENA_TICKET_PREFIX }}
+          athena_project_uuid: ${{ vars.ATHENA_PROJECT_UUID }}
+          athena_db_path: ${{ vars.ATHENA_DB_PATH }}
+          athena_base_url: ${{ secrets.ATHENA_BASE_URL }}
+          athena_token: ${{ secrets.ATHENA_TOKEN }}

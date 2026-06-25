@@ -1,0 +1,80 @@
+name: "Sync to Athena"
+description: "Bidirectional GitHub <-> Athena sync: create tickets from issues, link PRs to their matching task."
+author: "hahihula"
+
+inputs:
+  mode:
+    description: "Which sync flow to run: 'issue_to_task' or 'pr_to_comment'."
+    required: true
+  ticket_prefix:
+    description: "Ticket key prefix (e.g. 'EIM', 'ESP'). Used for task naming, hashtag, labels, and PR title parsing. Required — no default, to prevent silently filing tickets in the wrong project."
+    required: false
+  issue_number:
+    description: "Override issue number (for workflow_dispatch backfill)."
+    required: false
+  issue_title:
+    description: "Override issue title (for workflow_dispatch backfill)."
+    required: false
+  issue_body:
+    description: "Override issue body (for workflow_dispatch backfill)."
+    required: false
+  repo:
+    description: "owner/repo slug for gh CLI calls (e.g. espressif/idf-im-ui)."
+    required: true
+  event_path:
+    description: "Path to GitHub event JSON; defaults to $GITHUB_EVENT_PATH."
+    required: false
+  tasks_folder:
+    description: "Athena folder name where tickets are filed."
+    required: false
+    default: "📝 Tasks"
+  author:
+    description: "Author email written into the created nodes."
+    required: false
+    default: "github-actions@users.noreply.github.com"
+
+env:
+  ATHENA_PROJECT_UUID: ${{ inputs.athena_project_uuid }}
+  ATHENA_DB_PATH: ${{ inputs.athena_db_path }}
+  ATHENA_BASE_URL: ${{ inputs.athena_base_url }}
+  ATHENA_TOKEN: ${{ inputs.athena_token }}
+  ATHENA_TICKET_PREFIX: ${{ inputs.ticket_prefix }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install httpx>=0.27 markdown-it-py>=3.0
+        # Action source is vendored alongside the workflow; PYTHONPATH picks it up.
+        echo "PYTHONPATH=${GITHUB_ACTION_PATH}/src${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
+
+    - name: Sync issue -> Athena task
+      if: inputs.mode == 'issue_to_task'
+      shell: bash
+      env:
+        ATHENA_TASKS_FOLDER: ${{ inputs.tasks_folder }}
+        ATHENA_AUTHOR: ${{ inputs.author }}
+      run: |
+        python -m sync_athena.issue_to_task \
+          --repo "${{ inputs.repo }}" \
+          --event "${{ inputs.event_path }}" \
+          ${{ inputs.issue_number && format('--issue-number {0}', inputs.issue_number) || '' }} \
+          ${{ inputs.issue_title && format('--issue-title {0}', inputs.issue_title) || '' }} \
+          ${{ inputs.issue_body && format('--issue-body {0}', inputs.issue_body) || '' }}
+
+    - name: Sync PR -> Athena comment
+      if: inputs.mode == 'pr_to_comment'
+      shell: bash
+      env:
+        ATHENA_AUTHOR: ${{ inputs.author }}
+      run: |
+        python -m sync_athena.pr_to_comment \
+          --event "${{ inputs.event_path }}"
