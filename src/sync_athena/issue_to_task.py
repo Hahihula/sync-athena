@@ -61,22 +61,21 @@ def extract_issue_from_event(event: dict[str, Any]) -> tuple[int, str, str]:
 def ensure_tasks_folder(
     client: AthenaClient,
     *,
-    project_uuid: str,
     db_path: str,
     folder_name: str,
     author: str,
 ) -> str:
     """Return the id of the tasks folder, creating it on first use."""
+    root = client.get_project_root(db_path=db_path)
     folder = client.find_child_named(
-        parent_id=project_uuid,
+        parent_id=root.id,
         name=folder_name,
         db_path=db_path,
-        depth=1,
     )
     if folder is not None:
         return folder.id
     folder = client.create_child_folder(
-        parent_id=project_uuid,
+        parent_id=root.id,
         name=folder_name,
         db_path=db_path,
         author=author,
@@ -218,7 +217,6 @@ def main() -> int:
         with AthenaClient(base_url=base_url, token=token) as client:
             tasks_folder_id = ensure_tasks_folder(
                 client,
-                project_uuid=project_uuid,
                 db_path=db_path,
                 folder_name=folder_name,
                 author=author,

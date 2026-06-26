@@ -83,6 +83,8 @@ class AthenaClient:
         token: str,
         timeout: float = 30.0,
     ) -> None:
+        if "://" not in base_url:
+            base_url = "https://" + base_url
         self._base_url = base_url.rstrip("/")
         self._token = token
         self._client = httpx.Client(
@@ -126,33 +128,33 @@ class AthenaClient:
                 response.status_code, path, f"non-JSON body: {response.text[:200]}"
             ) from exc
 
-    def get_project_root(
-        self, *, project_uuid: str, db_path: str, depth: int = 3
-    ) -> Node:
-        """Fetch the project root node with ``depth`` levels of children."""
-        params = {
-            "node_id": project_uuid,
-            "depth": depth,
-            "_db_path": db_path,
-        }
-        data = self._request("GET", "/api/nodes/external", params=params)
-        node = data.get("node", data)
-        return Node.from_api(node)
+    def get_project_root(self, *, db_path: str) -> Node:
+        """Fetch the actual root node of a project via the tree endpoint.
+
+        The project UUID is only used to construct the db_path — the root
+        node has its own distinct UUID returned by /api/nodes/tree with
+        parent_id=null.
+        """
+        data = self._request(
+            "GET", "/api/nodes/tree", params={"parent_id": "null", "_db_path": db_path}
+        )
+        for node in data.get("tree", []):
+            if str(node.get("type", "")).upper() == "PROJECT":
+                return Node.from_api(node)
+        raise AthenaError(404, "/api/nodes/tree", "No PROJECT-typed root node found in tree")
 
     def find_child_named(
         self, *, parent_id: str, name: str, db_path: str, depth: int = 1
     ) -> Node | None:
         """Walk direct children of ``parent_id`` looking for ``name``."""
-        params = {
-            "node_id": parent_id,
-            "depth": depth,
-            "_db_path": db_path,
-        }
-        data = self._request("GET", "/api/nodes/external", params=params)
-        parent = data.get("node", data)
-        for child in parent.get("children", []) or []:
-            if child.get("name") == name:
-                return Node.from_api(child)
+        data = self._request(
+            "GET",
+            "/api/nodes/tree",
+            params={"parent_id": parent_id, "_db_path": db_path},
+        )
+        for node in data.get("tree", []) or []:
+            if node.get("name") == name:
+                return Node.from_api(node)
         return None
 
     def create_child_folder(
