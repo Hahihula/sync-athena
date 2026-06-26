@@ -3,12 +3,24 @@ description: "Bidirectional GitHub <-> Athena sync: create tickets from issues, 
 author: "hahihula"
 
 inputs:
+  athena_project_uuid:
+    description: "Athena project UUID."
+    required: true
+  athena_db_path:
+    description: "Athena database path."
+    required: true
+  athena_base_url:
+    description: "Athena base URL."
+    required: true
+  athena_token:
+    description: "Athena API token."
+    required: true
   mode:
     description: "Which sync flow to run: 'issue_to_task' or 'pr_to_comment'."
     required: true
   ticket_prefix:
     description: "Ticket key prefix (e.g. 'EIM', 'ESP'). Used for task naming, hashtag, labels, and PR title parsing. Required — no default, to prevent silently filing tickets in the wrong project."
-    required: false
+    required: true
   issue_number:
     description: "Override issue number (for workflow_dispatch backfill)."
     required: false
@@ -33,13 +45,6 @@ inputs:
     required: false
     default: "github-actions@users.noreply.github.com"
 
-env:
-  ATHENA_PROJECT_UUID: ${{ inputs.athena_project_uuid }}
-  ATHENA_DB_PATH: ${{ inputs.athena_db_path }}
-  ATHENA_BASE_URL: ${{ inputs.athena_base_url }}
-  ATHENA_TOKEN: ${{ inputs.athena_token }}
-  ATHENA_TICKET_PREFIX: ${{ inputs.ticket_prefix }}
-
 runs:
   using: "composite"
   steps:
@@ -60,21 +65,38 @@ runs:
       if: inputs.mode == 'issue_to_task'
       shell: bash
       env:
+        ATHENA_PROJECT_UUID: ${{ inputs.athena_project_uuid }}
+        ATHENA_DB_PATH: ${{ inputs.athena_db_path }}
+        ATHENA_BASE_URL: ${{ inputs.athena_base_url }}
+        ATHENA_TOKEN: ${{ inputs.athena_token }}
+        ATHENA_TICKET_PREFIX: ${{ inputs.ticket_prefix }}
         ATHENA_TASKS_FOLDER: ${{ inputs.tasks_folder }}
         ATHENA_AUTHOR: ${{ inputs.author }}
+        _REPO: ${{ inputs.repo }}
+        _EVENT_PATH: ${{ inputs.event_path }}
+        _ISSUE_NUMBER: ${{ inputs.issue_number }}
+        _ISSUE_TITLE: ${{ inputs.issue_title }}
+        _ISSUE_BODY: ${{ inputs.issue_body }}
       run: |
-        python -m sync_athena.issue_to_task \
-          --repo "${{ inputs.repo }}" \
-          --event "${{ inputs.event_path }}" \
-          ${{ inputs.issue_number && format('--issue-number {0}', inputs.issue_number) || '' }} \
-          ${{ inputs.issue_title && format('--issue-title {0}', inputs.issue_title) || '' }} \
-          ${{ inputs.issue_body && format('--issue-body {0}', inputs.issue_body) || '' }}
+        args=(--repo "$_REPO")
+        [ -n "$_EVENT_PATH" ] && args+=(--event "$_EVENT_PATH")
+        [ -n "$_ISSUE_NUMBER" ] && args+=(--issue-number "$_ISSUE_NUMBER")
+        [ -n "$_ISSUE_TITLE" ] && args+=(--issue-title "$_ISSUE_TITLE")
+        [ -n "$_ISSUE_BODY" ] && args+=(--issue-body "$_ISSUE_BODY")
+        python -m sync_athena.issue_to_task "${args[@]}"
 
     - name: Sync PR -> Athena comment
       if: inputs.mode == 'pr_to_comment'
       shell: bash
       env:
+        ATHENA_PROJECT_UUID: ${{ inputs.athena_project_uuid }}
+        ATHENA_DB_PATH: ${{ inputs.athena_db_path }}
+        ATHENA_BASE_URL: ${{ inputs.athena_base_url }}
+        ATHENA_TOKEN: ${{ inputs.athena_token }}
+        ATHENA_TICKET_PREFIX: ${{ inputs.ticket_prefix }}
         ATHENA_AUTHOR: ${{ inputs.author }}
+        _EVENT_PATH: ${{ inputs.event_path }}
       run: |
-        python -m sync_athena.pr_to_comment \
-          --event "${{ inputs.event_path }}"
+        args=()
+        [ -n "$_EVENT_PATH" ] && args+=(--event "$_EVENT_PATH")
+        python -m sync_athena.pr_to_comment "${args[@]}"

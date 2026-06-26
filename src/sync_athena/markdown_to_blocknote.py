@@ -48,7 +48,6 @@ def _parse_markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
             level = int(token.tag[1])  # h1 -> 1, h2 -> 2, etc.
             level = min(level, 3)  # BlockNote supports 1-3
             inline_token = tokens[i + 1] if i + 1 < len(tokens) else None
-            text = inline_token.content if inline_token else ""
             blocks.append(
                 {
                     "type": "heading",
@@ -285,13 +284,7 @@ def _parse_inline_content(text: str) -> list[dict[str, Any]]:
     tokens = md.parse(text)
 
     for token in tokens:
-        if token.type == "inline" or (token.type == "paragraph_open" and len(tokens) >= 2):
-            inline = None
-            for t in tokens:
-                if t.type == "inline":
-                    inline = t
-                    break
-            if inline:
-                return _convert_inline_tokens(inline)
+        if token.type == "inline":
+            return _convert_inline_tokens(token)
 
     return [{"type": "text", "text": text, "styles": {}}]
