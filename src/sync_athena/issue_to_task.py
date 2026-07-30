@@ -32,7 +32,7 @@ from sync_athena import AthenaClient, AthenaError, markdown_to_blocknote
 from sync_athena.counter import create_ticket
 
 DEFAULT_TASKS_FOLDER = "📝 Tasks"
-DEFAULT_AUTHOR = "github-actions@users.noreply.github.com"
+DEFAULT_AUTHOR = "GithubBot"
 
 
 def read_event(event_path: str | None) -> dict[str, Any]:
