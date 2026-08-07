@@ -24,9 +24,9 @@ from typing import Any
 
 from sync_athena import AthenaClient, AthenaError, markdown_to_blocknote
 from sync_athena.counter import (
-    extract_ticket_number,
+    extract_pr_key,
     hashtag_for_prefix,
-    make_pr_title_regex,
+    pr_hashtag,
 )
 
 DEFAULT_AUTHOR = "github-actions@users.noreply.github.com"
@@ -41,14 +41,6 @@ def read_event(event_path: str | None) -> dict[str, Any]:
         )
         sys.exit(1)
     return json.loads(Path(path).read_text())
-
-
-def extract_pr_key(title: str, prefix: str) -> int | None:
-    """Return the ``<PREFIX>-NNNN`` number from a PR title, or None."""
-    match = make_pr_title_regex(prefix).match(title.strip())
-    if not match:
-        return None
-    return int(match.group(1))
 
 
 def find_task_by_key(
@@ -79,6 +71,40 @@ def find_task_by_key(
         )
         return None
     return None
+
+
+def _tag_pr_on_task(
+    client: AthenaClient,
+    *,
+    task_id: str,
+    pr_number: int | None,
+    db_path: str,
+) -> None:
+    """Tag the parent task with ``github-pr-<n>`` so comment_to_task finds it.
+
+    The local ``AthenaClient`` only exposes PUT-replace for hashtags, so we
+    re-fetch the current list via ``get_node`` and append. Failure here is
+    non-fatal — the comment_to_task flow has a regex-based fallback.
+    """
+    if pr_number is None:
+        return
+    target = pr_hashtag(int(pr_number))
+    try:
+        node = client.get_node(node_id=task_id, db_path=db_path)
+    except AthenaError as exc:
+        print(f"::warning::could not read task {task_id} to tag PR: {exc}")
+        return
+    existing = node.raw.get("hashtags") or []
+    if target in existing:
+        return
+    try:
+        client.set_hashtags(
+            node_id=task_id,
+            hashtags=[*existing, target],
+            db_path=db_path,
+        )
+    except AthenaError as exc:
+        print(f"::warning::could not tag task with {target!r}: {exc}")
 
 
 def main() -> int:
@@ -149,6 +175,12 @@ def main() -> int:
                 description=markdown_to_blocknote(body_md),
                 db_path=db_path,
                 author=author,
+            )
+            _tag_pr_on_task(
+                client,
+                task_id=task_id,
+                pr_number=number,
+                db_path=db_path,
             )
     except AthenaError as exc:
         print(f"::warning::Athena API error, skipping: {exc}")

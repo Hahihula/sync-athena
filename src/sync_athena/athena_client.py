@@ -249,6 +249,61 @@ class AthenaClient:
         body = {"hashtags": hashtags}
         self._request("PUT", url, params=params, json_body=body)
 
+    def update_node(
+        self,
+        *,
+        node_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        db_path: str,
+    ) -> Node:
+        """PUT /api/nodes/{id} — partial update of a node.
+
+        Only fields explicitly provided are sent (``None`` means "do not
+        change"). The server returns the updated ``Node``.
+        """
+        params = {"_db_path": db_path}
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        if not body:
+            raise ValueError("update_node requires at least one of name/description")
+        data = self._request(
+            "PUT", f"/api/nodes/{node_id}", params=params, json_body=body
+        )
+        return Node.from_api(data.get("node", data))
+
+    def set_collaborators(
+        self,
+        *,
+        node_id: str,
+        editors: list[str],
+        co_authors: list[str],
+        db_path: str,
+    ) -> None:
+        """PUT /api/nodes/{id}/collaborators — replace editor + co-author lists.
+
+        Both lists are required (full replacement, server semantics).
+        The server rejects the node's own author appearing in either list
+        with HTTP 400, and rejects unknown users — callers should expect
+        :class:`AthenaError` and treat it as a non-fatal misconfiguration.
+        """
+        url = f"/api/nodes/{node_id}/collaborators"
+        params = {"_db_path": db_path}
+        body = {"editors": editors, "co_authors": co_authors}
+        self._request("PUT", url, params=params, json_body=body)
+
+    def get_node(self, *, node_id: str, db_path: str) -> Node:
+        """GET /api/nodes/external — fetch a single node by id."""
+        data = self._request(
+            "GET",
+            "/api/nodes/external",
+            params={"node_id": node_id, "depth": 0, "_db_path": db_path},
+        )
+        return Node.from_api(data.get("node", data))
+
     def create_shortlink(self, *, node_id: str, db_path: str) -> str | None:
         """Return the shareable weblink URL for a node, or None on failure.
 

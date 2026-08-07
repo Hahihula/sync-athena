@@ -48,6 +48,14 @@ def extract_ticket_number(name: str, prefix: str) -> int | None:
     return int(match.group(1))
 
 
+def extract_pr_key(title: str, prefix: str) -> int | None:
+    """Return the ``<PREFIX>-NNNN`` number from a PR title, or None."""
+    match = make_pr_title_regex(prefix).match(title.strip())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 def hashtag_for_prefix(prefix: str) -> str:
     """Derive the Athena hashtag used to index tickets for ``prefix``.
 
@@ -55,6 +63,38 @@ def hashtag_for_prefix(prefix: str) -> str:
     always normalize to one canonical form.
     """
     return prefix.strip().lower()
+
+
+def issue_hashtag(issue_number: int) -> str:
+    """Hashtag used to link a ticket back to its GitHub issue number."""
+    return f"github-issue-{issue_number}"
+
+
+def pr_hashtag(pr_number: int) -> str:
+    """Hashtag used to link a ticket back to its GitHub PR number."""
+    return f"github-pr-{pr_number}"
+
+
+def find_task_by_hashtag(
+    client: AthenaClient, *, db_path: str, hashtag: str
+) -> Node | None:
+    """Return the single task tagged with ``hashtag``, or None.
+
+    Used to look up an existing ticket for a known GitHub issue/PR number
+    so ``issue_to_task`` can update in place instead of creating duplicates.
+    Raises if the hashtag resolves to more than one task — that should never
+    happen if the workflow only runs against one Athena project per prefix.
+    """
+    matches = client.search_tasks(hashtag=hashtag, db_path=db_path)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise AthenaError(
+            status_code=500,
+            url=f"/api/nodes/advanced_search?hashtag={hashtag}",
+            body=f"hashtag {hashtag!r} matches {len(matches)} tasks; expected 1",
+        )
+    return None
 
 
 def next_ticket_number(

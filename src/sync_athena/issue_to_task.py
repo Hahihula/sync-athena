@@ -1,4 +1,4 @@
-"""CLI entrypoint: create one Athena task from one GitHub issue.
+"""CLI entrypoint: create or update one Athena task from one GitHub issue.
 
 Reads the GitHub event payload from ``$GITHUB_EVENT_PATH`` (or from ``--event``
 if set) and either:
@@ -7,6 +7,12 @@ if set) and either:
       workflow_dispatch inputs (backfill mode), or
     * when no flag is set, treats the event as an ``issues`` event and reads
       the issue from the JSON payload.
+
+The flow is idempotent: if a task already exists for the issue number
+(identified by the ``github-issue-<n>`` hashtag), the existing task is
+updated in place (name + description) instead of creating a duplicate.
+This makes it safe to trigger on ``issues: [opened, edited, reopened]``
+without producing a fresh ticket for each event.
 
 Writes to ``$GITHUB_OUTPUT`` in the format the workflow expects:
 
@@ -29,7 +35,12 @@ from pathlib import Path
 from typing import Any
 
 from sync_athena import AthenaClient, AthenaError, markdown_to_blocknote
-from sync_athena.counter import create_ticket
+from sync_athena.counter import (
+    create_ticket,
+    extract_ticket_number,
+    find_task_by_hashtag,
+    issue_hashtag,
+)
 
 DEFAULT_TASKS_FOLDER = "📝 Tasks"
 DEFAULT_AUTHOR = "GithubBot"
@@ -94,6 +105,19 @@ def emit_output(values: dict[str, str]) -> None:
     else:
         for line in lines:
             print(line)
+
+
+def parse_collaborators(raw: str) -> list[str]:
+    """Split a comma-separated ``editors``/``co_authors`` env value into emails.
+
+    Empty string and whitespace-only entries are dropped. Server rejects
+    the node's own author and unknown users — both surfaced as
+    ``AthenaError`` from ``set_collaborators`` so they fall into the
+    existing ``::warning::`` + exit 0 path.
+    """
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def post_issue_comment(repo: str, issue_number: int, body: str) -> None:
@@ -173,6 +197,36 @@ def add_issue_label(repo: str, issue_number: int, label: str, color: str) -> Non
         print(f"::warning::could not add label {label!r}: {exc}")
 
 
+def apply_collaborators(
+    client: AthenaClient,
+    *,
+    node_id: str,
+    editors: list[str],
+    co_authors: list[str],
+    db_path: str,
+) -> None:
+    """Set collaborator lists if any were provided.
+
+    Failures are surfaced as ``::warning::`` so a misconfigured editor
+    list doesn't fail the workflow — matches the rest of the action's
+    failure model.
+    """
+    if not editors and not co_authors:
+        return
+    try:
+        client.set_collaborators(
+            node_id=node_id,
+            editors=editors,
+            co_authors=co_authors,
+            db_path=db_path,
+        )
+    except AthenaError as exc:
+        print(
+            f"::warning::could not set collaborators "
+            f"(editors={editors!r}, co_authors={co_authors!r}): {exc}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--event", help="Path to GitHub event JSON (defaults to $GITHUB_EVENT_PATH)")
@@ -189,6 +243,8 @@ def main() -> int:
     folder_name = os.environ.get("ATHENA_TASKS_FOLDER", DEFAULT_TASKS_FOLDER)
     author = os.environ.get("ATHENA_AUTHOR", DEFAULT_AUTHOR)
     prefix = os.environ.get("ATHENA_TICKET_PREFIX", "")
+    editors = parse_collaborators(os.environ.get("ATHENA_EDITORS", ""))
+    co_authors = parse_collaborators(os.environ.get("ATHENA_CO_AUTHORS", ""))
 
     if not all([project_uuid, db_path, base_url, token]):
         print(
@@ -215,6 +271,47 @@ def main() -> int:
 
     try:
         with AthenaClient(base_url=base_url, token=token) as client:
+            existing = find_task_by_hashtag(
+                client, db_path=db_path, hashtag=issue_hashtag(issue_number)
+            )
+            if existing is not None:
+                number = extract_ticket_number(existing.name, prefix)
+                if number is None:
+                    print(
+                        f"::warning::existing task {existing.id} for issue "
+                        f"#{issue_number} has no parseable ticket number in name "
+                        f"{existing.name!r}; skipping in-place update"
+                    )
+                    return 0
+                key = f"{prefix}-{number}"
+                desired_name = f"{key}: {title}"
+                client.update_node(
+                    node_id=existing.id,
+                    name=desired_name,
+                    description=markdown_to_blocknote(body),
+                    db_path=db_path,
+                )
+                task_url = client.create_shortlink(
+                    node_id=existing.id, db_path=db_path
+                )
+                emit_output(
+                    {
+                        "ticket_key": key,
+                        "ticket_number": str(number),
+                        "task_id": existing.id,
+                        "task_url": task_url or "",
+                    }
+                )
+                apply_collaborators(
+                    client,
+                    node_id=existing.id,
+                    editors=editors,
+                    co_authors=co_authors,
+                    db_path=db_path,
+                )
+                print(f"Updated {key} ({existing.id}) for issue #{issue_number}")
+                return 0
+
             tasks_folder_id = ensure_tasks_folder(
                 client,
                 db_path=db_path,
@@ -235,18 +332,24 @@ def main() -> int:
             task_url = client.create_shortlink(
                 node_id=result.node.id, db_path=db_path
             )
+            emit_output(
+                {
+                    "ticket_key": result.key,
+                    "ticket_number": str(result.number),
+                    "task_id": result.node.id,
+                    "task_url": task_url or "",
+                }
+            )
+            apply_collaborators(
+                client,
+                node_id=result.node.id,
+                editors=editors,
+                co_authors=co_authors,
+                db_path=db_path,
+            )
     except AthenaError as exc:
         print(f"::warning::Athena API error, skipping: {exc}")
         return 0
-
-    emit_output(
-        {
-            "ticket_key": result.key,
-            "ticket_number": str(result.number),
-            "task_id": result.node.id,
-            "task_url": task_url or "",
-        }
-    )
 
     url_suffix = f" — {task_url}" if task_url else ""
     comment = (

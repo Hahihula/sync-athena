@@ -1,5 +1,5 @@
 name: "Sync to Athena"
-description: "Bidirectional GitHub <-> Athena sync: create tickets from issues, link PRs to their matching task."
+description: "Bidirectional GitHub <-> Athena sync: create tickets from issues, link PRs to their matching task, append comments as child notes."
 author: "hahihula"
 
 inputs:
@@ -16,7 +16,7 @@ inputs:
     description: "Athena API token."
     required: true
   mode:
-    description: "Which sync flow to run: 'issue_to_task' or 'pr_to_comment'."
+    description: "Which sync flow to run: 'issue_to_task', 'comment_to_task', or 'pr_to_comment'."
     required: true
   ticket_prefix:
     description: "Ticket key prefix (e.g. 'EIM', 'ESP'). Used for task naming, hashtag, labels, and PR title parsing. Required — no default, to prevent silently filing tickets in the wrong project."
@@ -44,6 +44,14 @@ inputs:
     description: "Author email written into the created nodes."
     required: false
     default: "github-actions@users.noreply.github.com"
+  editors:
+    description: "Comma-separated list of editor emails set on the created task (issue_to_task mode)."
+    required: false
+    default: ""
+  co_authors:
+    description: "Comma-separated list of co-author emails set on the created task (issue_to_task mode)."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -72,6 +80,8 @@ runs:
         ATHENA_TICKET_PREFIX: ${{ inputs.ticket_prefix }}
         ATHENA_TASKS_FOLDER: ${{ inputs.tasks_folder }}
         ATHENA_AUTHOR: ${{ inputs.author }}
+        ATHENA_EDITORS: ${{ inputs.editors }}
+        ATHENA_CO_AUTHORS: ${{ inputs.co_authors }}
         _REPO: ${{ inputs.repo }}
         _EVENT_PATH: ${{ inputs.event_path }}
         _ISSUE_NUMBER: ${{ inputs.issue_number }}
@@ -84,6 +94,22 @@ runs:
         [ -n "$_ISSUE_TITLE" ] && args+=(--issue-title "$_ISSUE_TITLE")
         [ -n "$_ISSUE_BODY" ] && args+=(--issue-body "$_ISSUE_BODY")
         python -m sync_athena.issue_to_task "${args[@]}"
+
+    - name: Sync comment -> Athena task
+      if: inputs.mode == 'comment_to_task'
+      shell: bash
+      env:
+        ATHENA_PROJECT_UUID: ${{ inputs.athena_project_uuid }}
+        ATHENA_DB_PATH: ${{ inputs.athena_db_path }}
+        ATHENA_BASE_URL: ${{ inputs.athena_base_url }}
+        ATHENA_TOKEN: ${{ inputs.athena_token }}
+        ATHENA_TICKET_PREFIX: ${{ inputs.ticket_prefix }}
+        ATHENA_AUTHOR: ${{ inputs.author }}
+        _EVENT_PATH: ${{ inputs.event_path }}
+      run: |
+        args=()
+        [ -n "$_EVENT_PATH" ] && args+=(--event "$_EVENT_PATH")
+        python -m sync_athena.comment_to_task "${args[@]}"
 
     - name: Sync PR -> Athena comment
       if: inputs.mode == 'pr_to_comment'
