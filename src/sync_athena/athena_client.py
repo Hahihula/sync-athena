@@ -259,9 +259,17 @@ class AthenaClient:
             status=status,
         )
         if hashtags:
-            self.set_hashtags(
-                node_id=node.id, hashtags=hashtags, db_path=db_path
-            )
+            # Non-fatal: the task exists and is findable by name whether or
+            # not the tags land. Aborting here used to strand a freshly
+            # created ticket with no tags, no collaborators, and no comment
+            # back on the GitHub issue.
+            try:
+                self.set_hashtags(
+                    node_id=node.id, hashtags=hashtags, db_path=db_path
+                )
+                node.hashtags = list(hashtags)
+            except AthenaError as exc:
+                print(f"::warning::could not tag {name!r}: {exc}")
         return node
 
     def create_child_note(
@@ -404,12 +412,18 @@ class AthenaClient:
             "description": description,
             "status": status,
             "color": "",
-            "author": author,
             "target_person": "",
             "whitelist": "",
             "parent_node_id": parent_id,
             "_db_path": db_path,
         }
+        # An empty author means "whoever this token is". The server stores
+        # the field verbatim and then checks *the caller* against it on
+        # every later write, so any invented string — a bot's display name,
+        # a token name, an email — permanently locks the action out of the
+        # node it just created. Only send one if explicitly overridden.
+        if author:
+            payload["author"] = author
         data = self._request("POST", "/api/nodes", json_body=payload)
         return Node.from_api(data.get("node", data))
 

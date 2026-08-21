@@ -46,7 +46,6 @@ from sync_athena.tickets import (
 )
 
 DEFAULT_TASKS_FOLDER = "📝 Tasks"
-DEFAULT_AUTHOR = "GithubBot"
 
 
 def read_event(event_path: str | None) -> dict[str, Any]:
@@ -158,7 +157,7 @@ def main() -> int:
     base_url = os.environ.get("ATHENA_BASE_URL", "")
     token = os.environ.get("ATHENA_TOKEN", "")
     folder_name = os.environ.get("ATHENA_TASKS_FOLDER", DEFAULT_TASKS_FOLDER)
-    author = os.environ.get("ATHENA_AUTHOR", DEFAULT_AUTHOR)
+    author = os.environ.get("ATHENA_AUTHOR", "").strip()
     prefix = os.environ.get("ATHENA_TICKET_PREFIX", "")
     email_domain = os.environ.get("ATHENA_EMAIL_DOMAIN", "")
     editors = parse_list(os.environ.get("ATHENA_EDITORS", ""), email_domain=email_domain)
@@ -187,6 +186,17 @@ def main() -> int:
         event = read_event(args.event)
         issue_number, title, body = extract_issue_from_event(event)
 
+    if author:
+        print(
+            f"::warning::'author' is set to {author!r}. Athena stores that "
+            f"string verbatim and then checks the *caller* against it, so "
+            f"unless it is exactly the identity your ATHENA_TOKEN "
+            f"authenticates as (bot tokens look like "
+            f"'bot-<hex>-<name>@bots.local'), every tag and collaborator "
+            f"write on the new task will be rejected with 403. Leave "
+            f"'author' empty to let the server fill it in."
+        )
+
     key = ticket_key(prefix, issue_number)
     description = markdown_to_blocknote(body)
 
@@ -207,12 +217,19 @@ def main() -> int:
             )
 
             if existing is not None:
-                task = client.update_node(
-                    node_id=existing.id,
-                    name=f"{key}: {title}",
-                    description=description,
-                    db_path=db_path,
-                )
+                try:
+                    task = client.update_node(
+                        node_id=existing.id,
+                        name=f"{key}: {title}",
+                        description=description,
+                        db_path=db_path,
+                    )
+                except AthenaError as exc:
+                    print(
+                        f"::warning::could not update {existing.name!r} "
+                        f"(created by {existing.author or 'unknown'!r}): {exc}"
+                    )
+                    task = existing
                 ensure_hashtags(
                     client,
                     node=existing,
@@ -230,6 +247,12 @@ def main() -> int:
                     author=author,
                     prefix=prefix,
                     issue_number=issue_number,
+                )
+                print(
+                    f"::notice::Athena recorded the task author as "
+                    f"{task.author or '(empty)'!r} — this is the identity "
+                    f"your ATHENA_TOKEN authenticates as, and the only one "
+                    f"allowed to edit the task's tags and collaborators."
                 )
 
             apply_collaborators(

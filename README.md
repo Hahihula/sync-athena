@@ -117,6 +117,33 @@ First match wins:
 
 A PR matching none of these is logged and skipped.
 
+## Leave `author` empty
+
+Athena stores the `author` field of a node **verbatim** as you send it, and
+then checks the *caller* against that stored string on every later write.
+So an invented value locks the action out of the node it just created:
+
+```
+403 You can only edit tags on nodes you created. This node was created by 'EimGitBot'.
+```
+
+`EimGitBot` there is not the server rejecting an unknown user — it is the
+string the workflow itself sent. The same happens with a bot's display name
+or a token's name. A bot's real identity is
+`bot-<6 hex project prefix>-<bot name>@bots.local`, which is not something
+a workflow should be guessing at.
+
+Omit `author` (the default) and the server fills in whoever the token is.
+The action logs it on first creation:
+
+```
+::notice::Athena recorded the task author as 'bot-7702e9-github-actions@bots.local'
+```
+
+Bearer tokens have no whoami endpoint — `/api/auth/check` only understands
+cookie sessions — so reading it back off a created node is the only way to
+learn the bot's identity.
+
 ## Editors and co-authors
 
 `PUT /api/nodes/{id}/collaborators` replaces both lists wholesale, requires
@@ -130,8 +157,7 @@ stronger role).
 Three things that make an assignment fail, each with its own warning:
 
 - **the token can't manage the node** — only the node author and project
-  admins can. If `author:` in the workflow names an identity other than the
-  token's own bot, every collaborator write gets a 403.
+  admins can, so a non-empty `author:` input causes this (see above).
 - **the address isn't a known Athena user** or isn't a member of the project.
 - **the address is the node's own author** — skipped with a `::notice::`
   rather than failing the request.
@@ -160,7 +186,7 @@ verbatim to the underlying Python entrypoint.
 | `repo` | yes for `issue_to_task` / `pr_to_comment` | – | `owner/repo` slug for `gh` calls |
 | `ticket_prefix` | yes | – | ticket key prefix (e.g. `EIM`, `ESP`). The action refuses to run without it, so a misconfigured repo can't accidentally file tickets in someone else's project. |
 | `tasks_folder` | no | `📝 Tasks` | Athena folder name where tickets are filed |
-| `author` | no | `github-actions@users.noreply.github.com` | author written into the created nodes. Must be the token's own identity, or collaborator writes get 403. |
+| `author` | no | `""` | **leave empty.** Stored verbatim as the node author; any value that isn't the token's own identity causes 403 on every later write. |
 | `editors` | no | `""` | comma-separated editor emails added to the task (`issue_to_task` only) |
 | `co_authors` | no | `""` | comma-separated co-author emails added to the task (`issue_to_task` only) |
 | `email_domain` | no | `""` | expands bare usernames in `editors` / `co_authors` (e.g. `espressif.com`) |

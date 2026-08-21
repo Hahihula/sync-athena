@@ -41,9 +41,14 @@ inputs:
     required: false
     default: "📝 Tasks"
   author:
-    description: "Author email written into the created nodes."
+    description: >
+      Leave empty (recommended). Athena stores this string verbatim as the node's
+      author and then checks the *caller* against it on every later write, so any
+      value that isn't exactly the identity your athena_token authenticates as
+      locks the action out of the node it just created (403 on tags and
+      collaborators). Empty means "whoever this token is" — the server fills it in.
     required: false
-    default: "github-actions@users.noreply.github.com"
+    default: ""
   editors:
     description: "Comma-separated list of editor emails set on the created task (issue_to_task mode)."
     required: false

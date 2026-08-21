@@ -44,7 +44,6 @@ from sync_athena.tickets import (
     ticket_key,
 )
 
-DEFAULT_AUTHOR = "github-actions@users.noreply.github.com"
 DEFAULT_TASKS_FOLDER = "📝 Tasks"
 
 
@@ -111,7 +110,7 @@ def main() -> int:
     db_path = os.environ.get("ATHENA_DB_PATH", "")
     base_url = os.environ.get("ATHENA_BASE_URL", "")
     token = os.environ.get("ATHENA_TOKEN", "")
-    author = os.environ.get("ATHENA_AUTHOR", DEFAULT_AUTHOR)
+    author = os.environ.get("ATHENA_AUTHOR", "").strip()
     prefix = os.environ.get("ATHENA_TICKET_PREFIX", "")
     folder_name = os.environ.get("ATHENA_TASKS_FOLDER", DEFAULT_TASKS_FOLDER)
 
