@@ -5,9 +5,9 @@ Action. Three modes:
 
 | mode | trigger | effect |
 | --- | --- | --- |
-| `issue_to_task` | `issues: [opened, edited, reopened]` or `workflow_dispatch` | creates a new `<PREFIX>-NNNN: <title>` task, or updates the existing one if a task with the same `github-issue-<n>` hashtag already exists. Optionally sets editors / co-authors. |
-| `comment_to_task` | `issue_comment: [created, edited]` | appends the comment as a `type=comment` child node on the matching task. Resolves issues via the `github-issue-<n>` hashtag and PRs via the `<PREFIX>-NNNN` title. |
-| `pr_to_comment` | `pull_request: [opened, reopened, ready_for_review]` | resolves `<PREFIX>-NNNN` from the PR title and posts a `type=comment` child node on the matching task with the PR URL |
+| `issue_to_task` | `issues: [opened, edited, reopened]` or `workflow_dispatch` | creates `<PREFIX>-<issue number>: <title>` as a task, or updates it if it already exists. Adds editors / co-authors. |
+| `comment_to_task` | `issue_comment: [created, edited]` | mirrors the comment as a `description` child node under the task, keyed by GitHub comment id so edits update rather than duplicate |
+| `pr_to_comment` | `pull_request: [opened, reopened, ready_for_review]` | resolves the task from the PR title key or a `#NNNN` issue reference, and posts a `solution` child node linking to the PR |
 
 The ticket prefix (`EIM`, `ESP`, anything) is a workflow input, so the same
 action serves any team that adopts Athena.
@@ -22,10 +22,11 @@ sync-athena/
 │   ├── __init__.py
 │   ├── athena_client.py              thin sync HTTP client
 │   ├── markdown_to_blocknote.py      markdown -> BlockNote JSON converter
-│   ├── counter.py                    next_ticket_number(), find_task_by_hashtag(), retry-on-duplicate
+│   ├── tickets.py                    ticket keys, GitHub ref parsing, duplicate detection
+│   ├── collaborators.py              additive, verified editor / co-author assignment
 │   ├── issue_to_task.py              entrypoint: GitHub issue -> Athena task (idempotent)
 │   ├── comment_to_task.py            entrypoint: GitHub issue/PR comment -> task child
-│   └── pr_to_comment.py              entrypoint: PR title -> comment child
+│   └── pr_to_comment.py              entrypoint: PR -> solution child linking the PR
 └── examples/
     ├── sync-athena.yml               main workflow (all three modes, triggers split)
     └── athena-pr-link.yml            PR-only workflow
@@ -57,69 +58,96 @@ athena bot token create -p "<your project name>" --bot github-actions \
     --name sync-ci --scopes nodes:read,nodes:write --duration 365d
 ```
 
-## How the "next ticket number" is computed
+## The ticket number is the GitHub issue number
 
-Athena has no native ticket numbering — nodes have UUIDs and weblink short
-IDs. The action derives the next free number by:
+`github.com/espressif/idf-im-ui/issues/1044` is always `EIM-1044`. The
+number is read from the issue's `html_url` (falling back to the payload's
+`number` field), so a key can be derived from the URL alone, is stable
+across re-runs, and cannot be raced by two issues opened at the same time.
 
-1. `GET /api/nodes/advanced_search?type=task&hashtag=<prefix-lowercased>&_db_path=...` — server-side filter by node type + hashtag.
-2. Parse names with `^<PREFIX>-(\d+):` client-side, take the max, `+1`.
-3. Retry up to 3 times if a concurrent issue creation stole the number.
+Every ticket is named `<PREFIX>-<n>: <title>` and tagged with hashtags
+`<prefix-lowercased>` and `github-issue-<n>`.
 
-Every ticket is tagged with hashtag `<prefix-lowercased>` (plus
-`github-issue-<n>`) and named `<PREFIX>-NNNN: <title>`, so the search stays
-cheap and the regex stays exact.
+## Duplicate prevention
 
-## Idempotency — `issue_to_task` updates instead of duplicating
+Duplicates were caused by relying on hashtag search to find the existing
+task: if the post-creation `PUT .../hashtags` call had failed, the search
+found nothing and the next run filed a second ticket.
 
-Before creating, `issue_to_task` searches for an existing task carrying the
-`github-issue-<n>` hashtag (set by every prior run for the same issue). If
-found, the task's `name` and `description` are updated in place via
-`PUT /api/nodes/{id}`; the original node UUID and ticket key are preserved
-so downstream PR references don't break.
+Lookup is now tree-first:
 
-This makes it safe to trigger on `issues: [opened, edited, reopened]` and
-`workflow_dispatch` backfills without producing duplicates. If the lookup
-returns more than one task the action aborts with `::warning::` (an
-invariant violation that should never happen for a single Athena project).
+1. list the children of the tasks folder and match on the `<PREFIX>-<n>`
+   name — this reads the tree itself, so no index or hashtag write can
+   hide an existing task;
+2. fall back to the `github-issue-<n>` hashtag search for tasks somebody
+   moved out of the folder.
 
-## Comment flow
+On a hit, `name` and `description` are updated in place via
+`PUT /api/nodes/{id}` — the node UUID and ticket key are preserved, so
+downstream PR references don't break — and any missing hashtags are
+repaired. An ambiguous lookup uses the first match and warns; it never
+creates another task.
 
-`comment_to_task` handles both issues and PRs (the `issue_comment` event
-fires for both). The lookup is:
+The child nodes are deduplicated the same way: PR links are keyed by
+`PR #<n>` and comments by `Comment #<github comment id>`, so the three
+`pull_request` trigger types can't stack up three copies of the same link.
 
-- **Issue comments**: `find_task_by_hashtag("github-issue-<n>")`. Fails
-  fast — if no task exists for the issue, the comment is dropped with a
-  warning.
-- **PR comments**: hashtag lookup first (`github-pr-<n>` — set by
-  `pr_to_comment` on the parent task), falling back to the PR-title regex
-  `^<PREFIX>-(\d+)\s*:` so a PR whose ticket was created manually still
-  resolves.
+## Child nodes: comments and PR links
 
-The comment body becomes a `type=comment` child node named
-`Comment on issue/PR #<n>`, so the original task description is preserved
-while the conversation history accumulates underneath it.
+Athena has no comment or discussion node type, so both flows create child
+nodes under the task:
 
-## PR title convention
+- **Comments** (`comment_to_task`) become `description` children named
+  `Comment #<comment id> on issue #<n>`. Re-running for an edited comment
+  updates that node instead of appending a copy.
+- **PR links** (`pr_to_comment`) become `solution` children named
+  `PR #<n>: <title>` — a PR is the proposed answer to the ticket.
 
-PR titles must start with `<PREFIX>-NNNN:`:
+The task description keeps the issue body; the conversation accumulates
+underneath it.
 
-```
-EIM-1234: Add login flow
-ESP-42: Fix bootloader reset
-```
+## How a PR finds its ticket
 
-Anything else is logged and skipped — matches the previous Jira
-PR-comment workflow's "no issue key found, skipping" behaviour.
+First match wins:
+
+1. a `<PREFIX>-NNNN` key anywhere in the PR title — `EIM-1044: Add login flow`;
+2. a `#NNNN` issue reference in the title or body — since the ticket number
+   *is* the issue number, `Closes #1044` resolves to `EIM-1044`;
+3. a `<PREFIX>-NNNN` key anywhere in the PR body.
+
+A PR matching none of these is logged and skipped.
+
+## Editors and co-authors
+
+`PUT /api/nodes/{id}/collaborators` replaces both lists wholesale, requires
+`apply_to_descendants` in the body, and rejects the whole request if the
+node's own author appears in either list. So the action reads the current
+lists, merges the configured entries in, drops the author, writes, and
+reads back to confirm. Existing collaborators added by hand in the UI are
+never dropped, and a user named in both roles ends up a co-author (the
+stronger role).
+
+Three things that make an assignment fail, each with its own warning:
+
+- **the token can't manage the node** — only the node author and project
+  admins can. If `author:` in the workflow names an identity other than the
+  token's own bot, every collaborator write gets a 403.
+- **the address isn't a known Athena user** or isn't a member of the project.
+- **the address is the node's own author** — skipped with a `::notice::`
+  rather than failing the request.
+
+Bare usernames are expanded against the optional `email_domain` input, so
+`petr.gadorek` and `petr.gadorek@espressif.com` behave the same.
 
 ## Idempotency / failure model
 
 - Any Athena API error → `::warning::` + exit 0. Workflow never fails.
-- Duplicate ticket number → retried up to 3 times before failing.
+- Existing task found → updated in place, never duplicated.
 - Missing `ATHENA_*` env → `::error::` + exit 1 (configuration error, not a runtime one).
 - `gh` missing on the runner → comment/label step logs a warning; the
   Athena write still succeeds.
-- `set_collaborators` failures (e.g. unknown user email) → `::warning::` + exit 0.
+- Collaborator failures → `::warning::` naming the address and reason; the
+  ticket is still created.
 
 ## Inputs
 
@@ -132,9 +160,10 @@ verbatim to the underlying Python entrypoint.
 | `repo` | yes for `issue_to_task` / `pr_to_comment` | – | `owner/repo` slug for `gh` calls |
 | `ticket_prefix` | yes | – | ticket key prefix (e.g. `EIM`, `ESP`). The action refuses to run without it, so a misconfigured repo can't accidentally file tickets in someone else's project. |
 | `tasks_folder` | no | `📝 Tasks` | Athena folder name where tickets are filed |
-| `author` | no | `github-actions@users.noreply.github.com` | email written into the created nodes |
-| `editors` | no | `""` | comma-separated editor emails set on the created task (`issue_to_task` only) |
-| `co_authors` | no | `""` | comma-separated co-author emails set on the created task (`issue_to_task` only) |
+| `author` | no | `github-actions@users.noreply.github.com` | author written into the created nodes. Must be the token's own identity, or collaborator writes get 403. |
+| `editors` | no | `""` | comma-separated editor emails added to the task (`issue_to_task` only) |
+| `co_authors` | no | `""` | comma-separated co-author emails added to the task (`issue_to_task` only) |
+| `email_domain` | no | `""` | expands bare usernames in `editors` / `co_authors` (e.g. `espressif.com`) |
 | `athena_token` | yes (via env) | – | bot token |
 | `athena_base_url` | yes (via env) | – | Athena server URL |
 | `athena_project_uuid` | yes (via env) | – | project UUID |

@@ -1,16 +1,24 @@
 """CLI entrypoint: link an opened/reopened PR to its matching Athena task.
 
-Reads ``$GITHUB_EVENT_PATH`` for a ``pull_request`` event, extracts the
-``<PREFIX>-NNNN`` key from the PR title (e.g. ``EIM-1234: title``), resolves
-it to the corresponding Athena task, and posts a ``type=comment`` child node
-under that task with a link to the PR.
+Reads ``$GITHUB_EVENT_PATH`` for a ``pull_request`` event, resolves the
+Athena task it belongs to, and posts a note child under that task linking
+to the PR. Athena has no discussion primitive, so the link is a plain
+child node hanging off the task.
 
-Mirrors the previous Jira PR-comment workflow's failure policy:
+Resolution order, first hit wins:
 
-    * No key found → log "skipping", exit 0.
+    1. a ``<PREFIX>-NNNN`` key in the PR title,
+    2. a ``#NNNN`` issue reference in the title or body — since the ticket
+       number *is* the issue number, ``Closes #1044`` resolves to
+       ``<PREFIX>-1044``,
+    3. a ``<PREFIX>-NNNN`` key anywhere in the PR body.
+
+Failure policy matches the rest of the action:
+
+    * No task resolved → log "skipping", exit 0.
     * Athena API error → ``::warning::`` + exit 0 (never fail the workflow).
-    * Key resolves to multiple tasks → pick the one whose name starts with
-      ``<PREFIX>-NNNN:`` exactly; if ambiguous, log a warning and skip.
+    * Note already posted for this PR → skip, so the three trigger types
+      (opened / reopened / ready_for_review) can't stack up duplicates.
 """
 
 from __future__ import annotations
@@ -23,13 +31,18 @@ from pathlib import Path
 from typing import Any
 
 from sync_athena import AthenaClient, AthenaError, markdown_to_blocknote
-from sync_athena.counter import (
-    extract_pr_key,
-    hashtag_for_prefix,
+from sync_athena.tickets import (
+    extract_issue_refs,
+    extract_ticket_refs,
+    find_child_note,
+    find_task_by_key,
+    find_tasks_folder,
     pr_hashtag,
+    ticket_key,
 )
 
 DEFAULT_AUTHOR = "github-actions@users.noreply.github.com"
+DEFAULT_TASKS_FOLDER = "📝 Tasks"
 
 
 def read_event(event_path: str | None) -> dict[str, Any]:
@@ -43,64 +56,40 @@ def read_event(event_path: str | None) -> dict[str, Any]:
     return json.loads(Path(path).read_text())
 
 
-def find_task_by_key(
-    client: AthenaClient, *, key: str, prefix: str, db_path: str
-) -> str | None:
-    """Resolve a ``<PREFIX>-NNNN`` key to a task node id.
-
-    Two-step to avoid false positives:
-        1. Search by hashtag ``<prefix-lowercased>`` + free text ``<key>``.
-        2. Filter client-side for an exact name prefix ``<key>:``.
-
-    Returns the task id, or None if not found / ambiguous.
-    """
-    matches = client.search_tasks(
-        hashtag=hashtag_for_prefix(prefix),
-        db_path=db_path,
-        extra_query=key,
-    )
-    name_prefix = f"{key}:"
-    candidates = [n for n in matches if n.name.startswith(name_prefix)]
-    if len(candidates) == 1:
-        return candidates[0].id
-    if len(candidates) > 1:
-        print(
-            f"::warning::multiple tasks match {key!r}: "
-            + ", ".join(c.name for c in candidates),
-            file=sys.stderr,
-        )
-        return None
-    return None
+def candidate_ticket_numbers(title: str, body: str, prefix: str) -> list[int]:
+    """Ticket numbers this PR might belong to, best guess first."""
+    ordered = [
+        *extract_ticket_refs(title, prefix),
+        *extract_issue_refs(title),
+        *extract_issue_refs(body),
+        *extract_ticket_refs(body, prefix),
+    ]
+    seen: list[int] = []
+    for number in ordered:
+        if number not in seen:
+            seen.append(number)
+    return seen
 
 
-def _tag_pr_on_task(
-    client: AthenaClient,
-    *,
-    task_id: str,
-    pr_number: int | None,
-    db_path: str,
+def tag_pr_on_task(
+    client: AthenaClient, *, task_id: str, pr_number: int, db_path: str
 ) -> None:
     """Tag the parent task with ``github-pr-<n>`` so comment_to_task finds it.
 
-    The local ``AthenaClient`` only exposes PUT-replace for hashtags, so we
-    re-fetch the current list via ``get_node`` and append. Failure here is
-    non-fatal — the comment_to_task flow has a regex-based fallback.
+    The API only offers PUT-replace for hashtags, so re-fetch and append.
     """
-    if pr_number is None:
-        return
-    target = pr_hashtag(int(pr_number))
+    target = pr_hashtag(pr_number)
     try:
         node = client.get_node(node_id=task_id, db_path=db_path)
     except AthenaError as exc:
         print(f"::warning::could not read task {task_id} to tag PR: {exc}")
         return
-    existing = node.raw.get("hashtags") or []
-    if target in existing:
+    if target in node.hashtags:
         return
     try:
         client.set_hashtags(
             node_id=task_id,
-            hashtags=[*existing, target],
+            hashtags=[*node.hashtags, target],
             db_path=db_path,
         )
     except AthenaError as exc:
@@ -118,6 +107,7 @@ def main() -> int:
     token = os.environ.get("ATHENA_TOKEN", "")
     author = os.environ.get("ATHENA_AUTHOR", DEFAULT_AUTHOR)
     prefix = os.environ.get("ATHENA_TICKET_PREFIX", "")
+    folder_name = os.environ.get("ATHENA_TASKS_FOLDER", DEFAULT_TASKS_FOLDER)
 
     if not all([project_uuid, db_path, base_url, token]):
         print(
@@ -141,52 +131,66 @@ def main() -> int:
         return 0
 
     title = pr.get("title", "")
-    number = pr.get("number")
+    body = pr.get("body") or ""
+    number = int(pr.get("number", 0))
     html_url = pr.get("html_url", "")
     author_login = (pr.get("user") or {}).get("login", "")
 
-    key_number = extract_pr_key(title, prefix)
-    if key_number is None:
+    candidates = candidate_ticket_numbers(title, body, prefix)
+    if not candidates:
         print(
-            f"No Athena key found in PR title: {title!r}. "
-            f"Expected format: {prefix}-NNNN: description"
+            f"No Athena ticket reference found in PR #{number}: {title!r}. "
+            f"Use a {prefix}-NNNN key in the title, or reference the issue "
+            f"(e.g. 'Closes #1044')."
         )
         return 0
-    key = f"{prefix}-{key_number}"
 
     try:
         with AthenaClient(base_url=base_url, token=token) as client:
-            task_id = find_task_by_key(
-                client, key=key, prefix=prefix, db_path=db_path
+            tasks_folder_id = find_tasks_folder(
+                client, db_path=db_path, folder_name=folder_name
             )
-            if task_id is None:
-                print(
-                    f"::warning::Athena task {key} not found for PR #{number} — skipping"
+            task = None
+            for candidate in candidates:
+                task = find_task_by_key(
+                    client,
+                    key=ticket_key(prefix, candidate),
+                    prefix=prefix,
+                    db_path=db_path,
+                    tasks_folder_id=tasks_folder_id,
                 )
+                if task is not None:
+                    break
+            if task is None:
+                tried = ", ".join(ticket_key(prefix, c) for c in candidates)
+                print(f"::warning::no Athena task found for PR #{number} (tried {tried}) — skipping")
                 return 0
 
-            body_md = (
-                f"PR opened by @{author_login}: [{title}]({html_url})"
-            )
-            comment_name = f"PR #{number}: {title}"
-            client.create_comment_child(
-                parent_id=task_id,
-                name=comment_name,
-                description=markdown_to_blocknote(body_md),
+            note_name = f"PR #{number}: {title}"
+            if find_child_note(
+                client, parent_id=task.id, name_prefix=f"PR #{number}:", db_path=db_path
+            ):
+                print(f"PR #{number} already linked to {task.name} — skipping")
+                return 0
+
+            client.create_child_note(
+                parent_id=task.id,
+                name=note_name,
+                description=markdown_to_blocknote(
+                    f"PR opened by @{author_login}: [{title}]({html_url})"
+                ),
                 db_path=db_path,
                 author=author,
+                node_type="solution",
             )
-            _tag_pr_on_task(
-                client,
-                task_id=task_id,
-                pr_number=number,
-                db_path=db_path,
+            tag_pr_on_task(
+                client, task_id=task.id, pr_number=number, db_path=db_path
             )
     except AthenaError as exc:
         print(f"::warning::Athena API error, skipping: {exc}")
         return 0
 
-    print(f"Linked PR #{number} to {key} (task {task_id})")
+    print(f"Linked PR #{number} to {task.name} (task {task.id})")
     return 0
 
 

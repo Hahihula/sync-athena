@@ -8,16 +8,15 @@ if set) and either:
     * when no flag is set, treats the event as an ``issues`` event and reads
       the issue from the JSON payload.
 
-The flow is idempotent: if a task already exists for the issue number
-(identified by the ``github-issue-<n>`` hashtag), the existing task is
-updated in place (name + description) instead of creating a duplicate.
-This makes it safe to trigger on ``issues: [opened, edited, reopened]``
-without producing a fresh ticket for each event.
+The ticket key is ``<PREFIX>-<issue number>`` — issue ``/issues/1044``
+becomes ``EIM-1044``. Before creating anything the tasks folder is scanned
+for that key, so re-running against the same issue updates the existing task
+in place instead of filing a second one.
 
 Writes to ``$GITHUB_OUTPUT`` in the format the workflow expects:
 
-    ticket_key=<PREFIX>-1234
-    ticket_number=1234
+    ticket_key=<PREFIX>-1044
+    ticket_number=1044
     task_id=<athena node uuid>
     task_url=<athena weblink url, may be empty if shortlink not yet created>
 
@@ -30,16 +29,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-from sync_athena import AthenaClient, AthenaError, markdown_to_blocknote
-from sync_athena.counter import (
+from sync_athena import AthenaClient, AthenaError, Node, markdown_to_blocknote
+from sync_athena.collaborators import apply_collaborators, parse_list
+from sync_athena.tickets import (
     create_ticket,
-    extract_ticket_number,
-    find_task_by_hashtag,
-    issue_hashtag,
+    ensure_tasks_folder,
+    find_task_for_issue,
+    issue_number_from_url,
+    ticket_hashtags,
+    ticket_key,
 )
 
 DEFAULT_TASKS_FOLDER = "📝 Tasks"
@@ -58,7 +61,12 @@ def read_event(event_path: str | None) -> dict[str, Any]:
 
 
 def extract_issue_from_event(event: dict[str, Any]) -> tuple[int, str, str]:
-    """Pull (number, title, body) from an issues-event payload."""
+    """Pull (number, title, body) from an issues-event payload.
+
+    The number comes from ``html_url`` when present — the URL is the
+    canonical source for the ticket number, and it is what a human reads off
+    the browser address bar when cross-checking a key.
+    """
     issue = event.get("issue")
     if not issue:
         print(
@@ -66,32 +74,10 @@ def extract_issue_from_event(event: dict[str, Any]) -> tuple[int, str, str]:
             file=sys.stderr,
         )
         sys.exit(0)
-    return int(issue["number"]), issue["title"], issue.get("body") or ""
-
-
-def ensure_tasks_folder(
-    client: AthenaClient,
-    *,
-    db_path: str,
-    folder_name: str,
-    author: str,
-) -> str:
-    """Return the id of the tasks folder, creating it on first use."""
-    root = client.get_project_root(db_path=db_path)
-    folder = client.find_child_named(
-        parent_id=root.id,
-        name=folder_name,
-        db_path=db_path,
-    )
-    if folder is not None:
-        return folder.id
-    folder = client.create_child_folder(
-        parent_id=root.id,
-        name=folder_name,
-        db_path=db_path,
-        author=author,
-    )
-    return folder.id
+    number = issue_number_from_url(issue.get("html_url", ""))
+    if number is None:
+        number = int(issue["number"])
+    return number, issue["title"], issue.get("body") or ""
 
 
 def emit_output(values: dict[str, str]) -> None:
@@ -107,124 +93,55 @@ def emit_output(values: dict[str, str]) -> None:
             print(line)
 
 
-def parse_collaborators(raw: str) -> list[str]:
-    """Split a comma-separated ``editors``/``co_authors`` env value into emails.
-
-    Empty string and whitespace-only entries are dropped. Server rejects
-    the node's own author and unknown users — both surfaced as
-    ``AthenaError`` from ``set_collaborators`` so they fall into the
-    existing ``::warning::`` + exit 0 path.
-    """
-    if not raw:
-        return []
-    return [part.strip() for part in raw.split(",") if part.strip()]
+def _gh(args: list[str], *, check: bool = True) -> None:
+    """Run a ``gh`` command with the workflow's token, non-fatally."""
+    env = os.environ.copy()
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if token:
+        env["GH_TOKEN"] = token
+    try:
+        subprocess.run(["gh", *args], check=check, env=env, capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        print(f"::warning::gh {' '.join(args[:2])} failed: {exc}")
 
 
 def post_issue_comment(repo: str, issue_number: int, body: str) -> None:
-    """Post a comment on the GitHub issue using ``gh`` (already on the runner).
-
-    Uses the GITHUB_TOKEN exposed to the workflow. Falls back silently if
-    ``gh`` is unavailable — callers shouldn't crash on a comment failure.
-    """
-    import subprocess
-
-    token = os.environ.get("GITHUB_TOKEN", "")
-    env = os.environ.copy()
-    if token:
-        env["GH_TOKEN"] = token
-    try:
-        subprocess.run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                str(issue_number),
-                "--repo",
-                repo,
-                "--body",
-                body,
-            ],
-            check=True,
-            env=env,
-            capture_output=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        print(f"::warning::could not post GitHub issue comment: {exc}")
+    _gh(["issue", "comment", str(issue_number), "--repo", repo, "--body", body])
 
 
 def add_issue_label(repo: str, issue_number: int, label: str, color: str) -> None:
-    """Create the label (idempotent) and add it to the issue via ``gh``."""
-    import subprocess
-
-    token = os.environ.get("GITHUB_TOKEN", "")
-    env = os.environ.copy()
-    if token:
-        env["GH_TOKEN"] = token
-    try:
-        subprocess.run(
-            [
-                "gh",
-                "label",
-                "create",
-                label,
-                "--repo",
-                repo,
-                "--color",
-                color,
-                "--description",
-                "Athena ticket reference",
-            ],
-            check=False,
-            env=env,
-            capture_output=True,
-        )
-        subprocess.run(
-            [
-                "gh",
-                "issue",
-                "edit",
-                str(issue_number),
-                "--repo",
-                repo,
-                "--add-label",
-                label,
-            ],
-            check=True,
-            env=env,
-            capture_output=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        print(f"::warning::could not add label {label!r}: {exc}")
+    """Create the label (idempotent) and add it to the issue."""
+    _gh(
+        [
+            "label", "create", label,
+            "--repo", repo,
+            "--color", color,
+            "--description", "Athena ticket reference",
+        ],
+        check=False,
+    )
+    _gh(["issue", "edit", str(issue_number), "--repo", repo, "--add-label", label])
 
 
-def apply_collaborators(
-    client: AthenaClient,
-    *,
-    node_id: str,
-    editors: list[str],
-    co_authors: list[str],
-    db_path: str,
+def ensure_hashtags(
+    client: AthenaClient, *, node: Node, prefix: str, issue_number: int, db_path: str
 ) -> None:
-    """Set collaborator lists if any were provided.
+    """Backfill the ticket hashtags on a task that is missing them.
 
-    Failures are surfaced as ``::warning::`` so a misconfigured editor
-    list doesn't fail the workflow — matches the rest of the action's
-    failure model.
+    An earlier run whose ``set_hashtags`` call failed leaves a task the
+    hashtag search cannot see; repairing it here keeps the search fallback
+    honest without a separate migration.
     """
-    if not editors and not co_authors:
+    wanted = ticket_hashtags(prefix, issue_number)
+    missing = [h for h in wanted if h not in node.hashtags]
+    if not missing:
         return
     try:
-        client.set_collaborators(
-            node_id=node_id,
-            editors=editors,
-            co_authors=co_authors,
-            db_path=db_path,
+        client.set_hashtags(
+            node_id=node.id, hashtags=[*node.hashtags, *missing], db_path=db_path
         )
     except AthenaError as exc:
-        print(
-            f"::warning::could not set collaborators "
-            f"(editors={editors!r}, co_authors={co_authors!r}): {exc}"
-        )
+        print(f"::warning::could not repair hashtags on {node.name!r}: {exc}")
 
 
 def main() -> int:
@@ -243,8 +160,9 @@ def main() -> int:
     folder_name = os.environ.get("ATHENA_TASKS_FOLDER", DEFAULT_TASKS_FOLDER)
     author = os.environ.get("ATHENA_AUTHOR", DEFAULT_AUTHOR)
     prefix = os.environ.get("ATHENA_TICKET_PREFIX", "")
-    editors = parse_collaborators(os.environ.get("ATHENA_EDITORS", ""))
-    co_authors = parse_collaborators(os.environ.get("ATHENA_CO_AUTHORS", ""))
+    email_domain = os.environ.get("ATHENA_EMAIL_DOMAIN", "")
+    editors = parse_list(os.environ.get("ATHENA_EDITORS", ""), email_domain=email_domain)
+    co_authors = parse_list(os.environ.get("ATHENA_CO_AUTHORS", ""), email_domain=email_domain)
 
     if not all([project_uuid, db_path, base_url, token]):
         print(
@@ -269,98 +187,86 @@ def main() -> int:
         event = read_event(args.event)
         issue_number, title, body = extract_issue_from_event(event)
 
+    key = ticket_key(prefix, issue_number)
+    description = markdown_to_blocknote(body)
+
     try:
         with AthenaClient(base_url=base_url, token=token) as client:
-            existing = find_task_by_hashtag(
-                client, db_path=db_path, hashtag=issue_hashtag(issue_number)
-            )
-            if existing is not None:
-                number = extract_ticket_number(existing.name, prefix)
-                if number is None:
-                    print(
-                        f"::warning::existing task {existing.id} for issue "
-                        f"#{issue_number} has no parseable ticket number in name "
-                        f"{existing.name!r}; skipping in-place update"
-                    )
-                    return 0
-                key = f"{prefix}-{number}"
-                desired_name = f"{key}: {title}"
-                client.update_node(
-                    node_id=existing.id,
-                    name=desired_name,
-                    description=markdown_to_blocknote(body),
-                    db_path=db_path,
-                )
-                task_url = client.create_shortlink(
-                    node_id=existing.id, db_path=db_path
-                )
-                emit_output(
-                    {
-                        "ticket_key": key,
-                        "ticket_number": str(number),
-                        "task_id": existing.id,
-                        "task_url": task_url or "",
-                    }
-                )
-                apply_collaborators(
-                    client,
-                    node_id=existing.id,
-                    editors=editors,
-                    co_authors=co_authors,
-                    db_path=db_path,
-                )
-                print(f"Updated {key} ({existing.id}) for issue #{issue_number}")
-                return 0
-
             tasks_folder_id = ensure_tasks_folder(
                 client,
                 db_path=db_path,
                 folder_name=folder_name,
                 author=author,
             )
-            result = create_ticket(
+            existing = find_task_for_issue(
                 client,
-                title=title,
-                body_markdown=body,
                 db_path=db_path,
                 tasks_folder_id=tasks_folder_id,
-                author=author,
                 prefix=prefix,
                 issue_number=issue_number,
-                body_to_blocknote=markdown_to_blocknote,
             )
-            task_url = client.create_shortlink(
-                node_id=result.node.id, db_path=db_path
-            )
-            emit_output(
-                {
-                    "ticket_key": result.key,
-                    "ticket_number": str(result.number),
-                    "task_id": result.node.id,
-                    "task_url": task_url or "",
-                }
-            )
+
+            if existing is not None:
+                task = client.update_node(
+                    node_id=existing.id,
+                    name=f"{key}: {title}",
+                    description=description,
+                    db_path=db_path,
+                )
+                ensure_hashtags(
+                    client,
+                    node=existing,
+                    prefix=prefix,
+                    issue_number=issue_number,
+                    db_path=db_path,
+                )
+            else:
+                task = create_ticket(
+                    client,
+                    title=title,
+                    description=description,
+                    db_path=db_path,
+                    tasks_folder_id=tasks_folder_id,
+                    author=author,
+                    prefix=prefix,
+                    issue_number=issue_number,
+                )
+
             apply_collaborators(
                 client,
-                node_id=result.node.id,
+                node_id=task.id,
                 editors=editors,
                 co_authors=co_authors,
                 db_path=db_path,
             )
+            task_url = client.create_shortlink(node_id=task.id, db_path=db_path)
     except AthenaError as exc:
         print(f"::warning::Athena API error, skipping: {exc}")
         return 0
 
-    url_suffix = f" — {task_url}" if task_url else ""
-    comment = (
-        f"Created Athena task **{result.key}**: {title}{url_suffix}\n\n"
-        f"Reference this key in PR titles (e.g. `{result.key}: <description>`) "
-        f"to link future PRs to this task."
+    emit_output(
+        {
+            "ticket_key": key,
+            "ticket_number": str(issue_number),
+            "task_id": task.id,
+            "task_url": task_url or "",
+        }
     )
-    post_issue_comment(args.repo, issue_number, comment)
-    add_issue_label(args.repo, issue_number, result.key, "1d76db")
 
-    print(f"Created {result.key} ({result.node.id}) for issue #{issue_number}")
+    if existing is not None:
+        print(f"Updated {key} ({task.id}) for issue #{issue_number}")
+        return 0
+
+    url_suffix = f" — {task_url}" if task_url else ""
+    post_issue_comment(
+        args.repo,
+        issue_number,
+        f"Created Athena task **{key}**: {title}{url_suffix}\n\n"
+        f"Reference this key in PR titles (e.g. `{key}: <description>`) "
+        f"to link future PRs to this task.",
+    )
+    add_issue_label(args.repo, issue_number, key, "1d76db")
+    print(f"Created {key} ({task.id}) for issue #{issue_number}")
     return 0
 
 

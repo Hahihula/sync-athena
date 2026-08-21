@@ -3,13 +3,16 @@
 Only the surface area `sync-athena` actually needs:
 
     - get_project_root(project_uuid, db_path)            -> Node
+    - list_children(parent_id, db_path)                 -> list[Node]
     - find_child_named(parent_id, name, db_path)        -> Node | None
     - create_child_folder(parent_id, name, db_path)     -> Node
     - search_tasks(hashtag, db_path)                    -> list[Node]
     - create_task(parent_id, name, description, db_path, *, status, author, hashtags)
                                                           -> Node
-    - create_comment_child(parent_id, name, description, db_path, *, author)
+    - create_child_note(parent_id, name, description, db_path, *, author, node_type)
                                                           -> Node
+    - get_collaborators(node_id, db_path)               -> Collaborators
+    - set_collaborators(node_id, editors, co_authors, db_path)
     - create_shortlink(node_id, db_path)                -> weblink URL
 
 Async would mirror athena-client, but a GitHub Actions script makes a handful
@@ -53,6 +56,8 @@ class Node:
     parent_node_id: str | None = None
     has_children: bool = False
     status: str | None = None
+    author: str = ""
+    hashtags: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -69,7 +74,36 @@ class Node:
             ),
             has_children=bool(data.get("has_children", False)),
             status=data.get("status"),
+            author=data.get("author") or "",
+            hashtags=list(data.get("hashtags") or []),
             raw=data,
+        )
+
+
+@dataclass
+class Collaborators:
+    """Response shape of ``GET/PUT /api/nodes/{id}/collaborators``.
+
+    ``manageable`` is the server telling us whether the *calling* token may
+    change these lists — only the node author and project admins may. A
+    false value is the usual reason a co-author assignment silently fails.
+    """
+
+    author: str = ""
+    editors: list[str] = field(default_factory=list)
+    co_authors: list[str] = field(default_factory=list)
+    manageable: bool = False
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any]) -> Collaborators:
+        def emails(raw: Any) -> list[str]:
+            return [e["email"] if isinstance(e, dict) else e for e in (raw or [])]
+
+        return cls(
+            author=data.get("author") or "",
+            editors=emails(data.get("editors")),
+            co_authors=emails(data.get("co_authors")),
+            manageable=bool(data.get("manageable", False)),
         )
 
 
@@ -143,18 +177,27 @@ class AthenaClient:
                 return Node.from_api(node)
         raise AthenaError(404, "/api/nodes/tree", "No PROJECT-typed root node found in tree")
 
-    def find_child_named(
-        self, *, parent_id: str, name: str, db_path: str, depth: int = 1
-    ) -> Node | None:
-        """Walk direct children of ``parent_id`` looking for ``name``."""
+    def list_children(self, *, parent_id: str, db_path: str) -> list[Node]:
+        """Return the direct children of ``parent_id``.
+
+        This is the duplicate-detection primitive: unlike
+        ``advanced_search`` it reads the tree directly, so it cannot miss a
+        node because a hashtag write failed or a search index lagged.
+        """
         data = self._request(
             "GET",
             "/api/nodes/tree",
             params={"parent_id": parent_id, "_db_path": db_path},
         )
-        for node in data.get("tree", []) or []:
-            if node.get("name") == name:
-                return Node.from_api(node)
+        return [Node.from_api(raw) for raw in data.get("tree", []) or []]
+
+    def find_child_named(
+        self, *, parent_id: str, name: str, db_path: str
+    ) -> Node | None:
+        """Walk direct children of ``parent_id`` looking for ``name``."""
+        for node in self.list_children(parent_id=parent_id, db_path=db_path):
+            if node.name == name:
+                return node
         return None
 
     def create_child_folder(
@@ -221,7 +264,7 @@ class AthenaClient:
             )
         return node
 
-    def create_comment_child(
+    def create_child_note(
         self,
         *,
         parent_id: str,
@@ -229,12 +272,18 @@ class AthenaClient:
         description: str,
         db_path: str,
         author: str,
+        node_type: str = "description",
     ) -> Node:
-        """Create a ``type=comment`` child node — the PR-link primitive."""
+        """Create a note child under a task — the discussion primitive.
+
+        Athena has no comment node type, so GitHub comments become plain
+        ``description`` children hanging off the task, and PR links become
+        ``solution`` children (a PR is the proposed answer to the ticket).
+        """
         return self._create_node(
             parent_id=parent_id,
             name=name,
-            node_type="comment",
+            node_type=node_type,
             description=description,
             db_path=db_path,
             author=author,
@@ -275,6 +324,15 @@ class AthenaClient:
         )
         return Node.from_api(data.get("node", data))
 
+    def get_collaborators(self, *, node_id: str, db_path: str) -> Collaborators:
+        """GET /api/nodes/{id}/collaborators — current lists plus the author."""
+        data = self._request(
+            "GET",
+            f"/api/nodes/{node_id}/collaborators",
+            params={"_db_path": db_path},
+        )
+        return Collaborators.from_api(data)
+
     def set_collaborators(
         self,
         *,
@@ -282,18 +340,26 @@ class AthenaClient:
         editors: list[str],
         co_authors: list[str],
         db_path: str,
-    ) -> None:
+        apply_to_descendants: bool = False,
+    ) -> Collaborators:
         """PUT /api/nodes/{id}/collaborators — replace editor + co-author lists.
 
-        Both lists are required (full replacement, server semantics).
-        The server rejects the node's own author appearing in either list
-        with HTTP 400, and rejects unknown users — callers should expect
-        :class:`AthenaError` and treat it as a non-fatal misconfiguration.
+        All three body fields are required by the server; omitting
+        ``apply_to_descendants`` gets the request rejected outright.
+        The server also rejects the node's own author appearing in either
+        list, and rejects unknown users.
         """
-        url = f"/api/nodes/{node_id}/collaborators"
-        params = {"_db_path": db_path}
-        body = {"editors": editors, "co_authors": co_authors}
-        self._request("PUT", url, params=params, json_body=body)
+        data = self._request(
+            "PUT",
+            f"/api/nodes/{node_id}/collaborators",
+            params={"_db_path": db_path},
+            json_body={
+                "editors": editors,
+                "co_authors": co_authors,
+                "apply_to_descendants": apply_to_descendants,
+            },
+        )
+        return Collaborators.from_api(data)
 
     def get_node(self, *, node_id: str, db_path: str) -> Node:
         """GET /api/nodes/external — fetch a single node by id."""

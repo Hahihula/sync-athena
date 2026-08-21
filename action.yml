@@ -19,7 +19,7 @@ inputs:
     description: "Which sync flow to run: 'issue_to_task', 'comment_to_task', or 'pr_to_comment'."
     required: true
   ticket_prefix:
-    description: "Ticket key prefix (e.g. 'EIM', 'ESP'). Used for task naming, hashtag, labels, and PR title parsing. Required — no default, to prevent silently filing tickets in the wrong project."
+    description: "Ticket key prefix (e.g. 'EIM', 'ESP'). Combined with the GitHub issue number to form the ticket key: issue #1044 becomes EIM-1044. Required — no default, to prevent silently filing tickets in the wrong project."
     required: true
   issue_number:
     description: "Override issue number (for workflow_dispatch backfill)."
@@ -49,7 +49,11 @@ inputs:
     required: false
     default: ""
   co_authors:
-    description: "Comma-separated list of co-author emails set on the created task (issue_to_task mode)."
+    description: "Comma-separated list of co-author emails added to the created task (issue_to_task mode). Existing collaborators are kept."
+    required: false
+    default: ""
+  email_domain:
+    description: "Domain used to expand bare usernames in 'editors'/'co_authors' (e.g. 'espressif.com'). Entries already containing '@' are left alone."
     required: false
     default: ""
 
@@ -82,6 +86,7 @@ runs:
         ATHENA_AUTHOR: ${{ inputs.author }}
         ATHENA_EDITORS: ${{ inputs.editors }}
         ATHENA_CO_AUTHORS: ${{ inputs.co_authors }}
+        ATHENA_EMAIL_DOMAIN: ${{ inputs.email_domain }}
         _REPO: ${{ inputs.repo }}
         _EVENT_PATH: ${{ inputs.event_path }}
         _ISSUE_NUMBER: ${{ inputs.issue_number }}
@@ -104,6 +109,7 @@ runs:
         ATHENA_BASE_URL: ${{ inputs.athena_base_url }}
         ATHENA_TOKEN: ${{ inputs.athena_token }}
         ATHENA_TICKET_PREFIX: ${{ inputs.ticket_prefix }}
+        ATHENA_TASKS_FOLDER: ${{ inputs.tasks_folder }}
         ATHENA_AUTHOR: ${{ inputs.author }}
         _EVENT_PATH: ${{ inputs.event_path }}
       run: |
@@ -120,6 +126,7 @@ runs:
         ATHENA_BASE_URL: ${{ inputs.athena_base_url }}
         ATHENA_TOKEN: ${{ inputs.athena_token }}
         ATHENA_TICKET_PREFIX: ${{ inputs.ticket_prefix }}
+        ATHENA_TASKS_FOLDER: ${{ inputs.tasks_folder }}
         ATHENA_AUTHOR: ${{ inputs.author }}
         _EVENT_PATH: ${{ inputs.event_path }}
       run: |
