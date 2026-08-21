@@ -23,9 +23,36 @@ ISSUE_URL_RE = re.compile(r"/(?:issues|pull)/(\d+)")
 ISSUE_REF_RE = re.compile(r"#(\d+)")
 
 
+#: Athena's kanban columns, from ``athena.tui.screens.kanban``. ``CANCELLED``
+#: is a real status the board folds into the DONE column.
+TODO = "TODO"
+DONE = "DONE"
+CANCELLED = "CANCELLED"
+
+
 def ticket_key(prefix: str, number: int) -> str:
     """Build the ``<PREFIX>-<number>`` key."""
     return f"{prefix}-{number}"
+
+
+def status_for_issue(
+    *, action: str = "", state: str = "", state_reason: str = ""
+) -> str | None:
+    """Map a GitHub issue's state onto an Athena task status.
+
+    ``None`` means "leave the status alone" — an issue merely being edited
+    must not drag a task somebody moved to IN REVIEW back to TODO.
+
+        closed (completed)   -> DONE
+        closed (not planned) -> CANCELLED
+        reopened             -> TODO
+        anything else        -> None
+    """
+    if action == "reopened":
+        return TODO
+    if (state or "").strip().upper() == "CLOSED":
+        return CANCELLED if (state_reason or "") == "not_planned" else DONE
+    return None
 
 
 def make_ticket_name_regex(prefix: str) -> re.Pattern[str]:
@@ -243,7 +270,7 @@ def create_ticket(
     author: str,
     prefix: str,
     issue_number: int,
-    initial_status: str = "TODO",
+    initial_status: str | None = None,
 ) -> Node:
     """Create the ``<PREFIX>-<issue_number>: <title>`` task."""
     key = ticket_key(prefix, issue_number)
@@ -253,6 +280,6 @@ def create_ticket(
         description=description,
         db_path=db_path,
         author=author,
-        status=initial_status,
+        status=initial_status or TODO,
         hashtags=ticket_hashtags(prefix, issue_number),
     )

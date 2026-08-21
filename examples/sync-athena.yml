@@ -9,7 +9,7 @@ run-name: >
 
 on:
   issues:
-    types: [opened, edited, reopened]
+    types: [opened, edited, reopened, closed]
   issue_comment:
     types: [created, edited]
   pull_request:
@@ -19,6 +19,9 @@ on:
       issue-numbers:
         description: "Issue numbers to backfill (comma-separated)"
         required: true
+
+permissions:
+  contents: read
 
 jobs:
   issue-to-task:
@@ -33,6 +36,8 @@ jobs:
         uses: ./.github/actions/sync-athena
         with:
           mode: issue_to_task
+          # Required for the workflow_dispatch backfill; empty on issue events.
+          issue_number: ${{ inputs.issue-numbers }}
           repo: ${{ github.repository }}
           ticket_prefix: ${{ vars.ATHENA_TICKET_PREFIX }}
           editors: ${{ vars.ATHENA_EDITORS }}

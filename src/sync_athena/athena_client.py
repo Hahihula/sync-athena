@@ -312,6 +312,7 @@ class AthenaClient:
         node_id: str,
         name: str | None = None,
         description: str | None = None,
+        status: str | None = None,
         db_path: str,
     ) -> Node:
         """PUT /api/nodes/{id} — partial update of a node.
@@ -325,8 +326,12 @@ class AthenaClient:
             body["name"] = name
         if description is not None:
             body["description"] = description
+        if status is not None:
+            body["status"] = status
         if not body:
-            raise ValueError("update_node requires at least one of name/description")
+            raise ValueError(
+                "update_node requires at least one of name/description/status"
+            )
         data = self._request(
             "PUT", f"/api/nodes/{node_id}", params=params, json_body=body
         )

@@ -5,7 +5,7 @@ Action. Three modes:
 
 | mode | trigger | effect |
 | --- | --- | --- |
-| `issue_to_task` | `issues: [opened, edited, reopened]` or `workflow_dispatch` | creates `<PREFIX>-<issue number>: <title>` as a task, or updates it if it already exists. Adds editors / co-authors. |
+| `issue_to_task` | `issues: [opened, edited, reopened, closed]` or `workflow_dispatch` | creates `<PREFIX>-<issue number>: <title>` as a task, or updates it if it already exists. Moves the task to `DONE` / `CANCELLED` when the issue closes. Adds editors / co-authors. |
 | `comment_to_task` | `issue_comment: [created, edited]` | mirrors the comment as a `description` child node under the task, keyed by GitHub comment id so edits update rather than duplicate |
 | `pr_to_comment` | `pull_request: [opened, reopened, ready_for_review]` | resolves the task from the PR title key or a `#NNNN` issue reference, and posts a `solution` child node linking to the PR |
 
@@ -117,6 +117,57 @@ First match wins:
 
 A PR matching none of these is logged and skipped.
 
+## Closing an issue moves the task
+
+Add `closed` to the `issues` trigger types and the task follows the issue:
+
+| GitHub | Athena status |
+| --- | --- |
+| closed as **completed** | `DONE` |
+| closed as **not planned** | `CANCELLED` |
+| reopened | `TODO` |
+| opened | `TODO` (on creation only) |
+| edited, labeled, … | *unchanged* |
+
+Status is only written on close and reopen. Any other event leaves it
+alone, so a task somebody moved to `IN PROGRESS` or `IN REVIEW` on the
+board isn't dragged back to `TODO` the next time the issue title is
+edited. Backfilled issues carry their state over too — an old closed
+issue files as `DONE`, not `TODO`.
+
+The column names come from Athena's own kanban
+(`TODO / IN PROGRESS / IN REVIEW / DONE`, with `CANCELLED` folded into the
+DONE column).
+
+## Backfilling existing issues
+
+`workflow_dispatch` with the `issue_number` input syncs issues that predate
+the action. It accepts one number or a comma-separated list, and reads each
+issue's real title and body from GitHub via `gh` — a backfilled ticket is
+indistinguishable from one filed by the `issues` trigger:
+
+```yaml
+workflow_dispatch:
+  inputs:
+    issue-numbers:
+      description: "Issue numbers to backfill (comma-separated)"
+      required: true
+```
+
+```yaml
+- uses: hahihula/sync-athena@v1
+  with:
+    mode: issue_to_task
+    issue_number: ${{ inputs.issue-numbers }}   # must be wired through
+    repo: ${{ github.repository }}
+    # …
+```
+
+Wiring `issue_number` is not optional: without it the action reads the
+dispatch payload, finds no `issue` field, and exits 0 having done nothing.
+Backfilling several issues emits the `$GITHUB_OUTPUT` values of the last
+one — those outputs describe a single ticket.
+
 ## Leave `author` empty
 
 Athena stores the `author` field of a node **verbatim** as you send it, and
@@ -187,6 +238,7 @@ verbatim to the underlying Python entrypoint.
 | `ticket_prefix` | yes | – | ticket key prefix (e.g. `EIM`, `ESP`). The action refuses to run without it, so a misconfigured repo can't accidentally file tickets in someone else's project. |
 | `tasks_folder` | no | `📝 Tasks` | Athena folder name where tickets are filed |
 | `author` | no | `""` | **leave empty.** Stored verbatim as the node author; any value that isn't the token's own identity causes 403 on every later write. |
+| `github_token` | no | `${{ github.token }}` | used by the `gh` calls (issue comment, label, backfill title lookup). Composite steps don't inherit `GITHUB_TOKEN`; without it `gh` exits 4. |
 | `editors` | no | `""` | comma-separated editor emails added to the task (`issue_to_task` only) |
 | `co_authors` | no | `""` | comma-separated co-author emails added to the task (`issue_to_task` only) |
 | `email_domain` | no | `""` | expands bare usernames in `editors` / `co_authors` (e.g. `espressif.com`) |

@@ -33,6 +33,14 @@ inputs:
   repo:
     description: "owner/repo slug for gh CLI calls (e.g. espressif/idf-im-ui)."
     required: true
+  github_token:
+    description: >
+      Token for the gh CLI calls that comment on and label the issue, and that read
+      issue titles during a backfill. Defaults to the workflow's own GITHUB_TOKEN;
+      the calling job needs `permissions: issues: write`. Composite-action steps do
+      not inherit GITHUB_TOKEN automatically — without this, gh exits 4.
+    required: false
+    default: ${{ github.token }}
   event_path:
     description: "Path to GitHub event JSON; defaults to $GITHUB_EVENT_PATH."
     required: false
@@ -92,6 +100,7 @@ runs:
         ATHENA_EDITORS: ${{ inputs.editors }}
         ATHENA_CO_AUTHORS: ${{ inputs.co_authors }}
         ATHENA_EMAIL_DOMAIN: ${{ inputs.email_domain }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
         _REPO: ${{ inputs.repo }}
         _EVENT_PATH: ${{ inputs.event_path }}
         _ISSUE_NUMBER: ${{ inputs.issue_number }}
