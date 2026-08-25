@@ -319,21 +319,28 @@ class AthenaClient:
 
         Only fields explicitly provided are sent (``None`` means "do not
         change"). The server returns the updated ``Node``.
+
+        ``_db_path`` goes in the *body* here, unlike the read endpoints
+        which take it as a query param. Sent as a query param the server
+        resolves the id against the caller's personal database instead of
+        the project's and answers 404 "Node not found" for a node that
+        plainly exists.
         """
-        params = {"_db_path": db_path}
-        body: dict[str, Any] = {}
+        fields: dict[str, Any] = {}
         if name is not None:
-            body["name"] = name
+            fields["name"] = name
         if description is not None:
-            body["description"] = description
+            fields["description"] = description
         if status is not None:
-            body["status"] = status
-        if not body:
+            fields["status"] = status
+        if not fields:
             raise ValueError(
                 "update_node requires at least one of name/description/status"
             )
         data = self._request(
-            "PUT", f"/api/nodes/{node_id}", params=params, json_body=body
+            "PUT",
+            f"/api/nodes/{node_id}",
+            json_body={**fields, "_db_path": db_path},
         )
         return Node.from_api(data.get("node", data))
 
