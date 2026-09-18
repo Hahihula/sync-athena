@@ -3,6 +3,15 @@
 Bidirectional GitHub ↔ Athena sync, packaged as a reusable composite GitHub
 Action. Three modes:
 
+## Where the code lives
+
+This repo (GitHub, public) holds only `action.yml`. It logs in to the
+internal Docker registry and runs a prebuilt image — it has no Python source
+of its own. The actual `sync_athena` implementation lives in the internal
+GitLab mirror at `idf/sync-athena`, whose `.gitlab-ci.yml` builds and pushes
+`gitlab.espressif.cn:5050/idf/sync-athena:latest` on every push to `main`.
+To change sync behavior, edit the GitLab repo, not this one.
+
 | mode | trigger | effect |
 | --- | --- | --- |
 | `issue_to_task` | `issues: [opened, edited, reopened, closed]` or `workflow_dispatch` | creates `<PREFIX>-<issue number>: <title>` as a task, or updates it if it already exists. Moves the task to `DONE` / `CANCELLED` when the issue closes. Adds editors / co-authors. |
@@ -15,21 +24,28 @@ action serves any team that adopts Athena.
 ## Layout
 
 ```
-sync-athena/
-├── action.yml                        composite action manifest
-├── requirements.txt                  httpx, markdown-it-py (both public PyPI)
-├── src/sync_athena/
-│   ├── __init__.py
-│   ├── athena_client.py              thin sync HTTP client
-│   ├── markdown_to_blocknote.py      markdown -> BlockNote JSON converter
-│   ├── tickets.py                    ticket keys, GitHub ref parsing, duplicate detection
-│   ├── collaborators.py              additive, verified editor / co-author assignment
-│   ├── issue_to_task.py              entrypoint: GitHub issue -> Athena task (idempotent)
-│   ├── comment_to_task.py            entrypoint: GitHub issue/PR comment -> task child
-│   └── pr_to_comment.py              entrypoint: PR -> solution child linking the PR
+sync-athena/                          (this repo — GitHub, public)
+├── action.yml                        composite action: docker login -> pull -> run
 └── examples/
     ├── sync-athena.yml               main workflow (all three modes, triggers split)
     └── athena-pr-link.yml            PR-only workflow
+```
+
+```
+idf/sync-athena/                      (GitLab, internal — source of truth for behavior)
+├── Dockerfile                        python:3.11-slim + gh CLI + src/
+├── docker-entrypoint.sh              dispatches MODE -> python -m sync_athena.<mode>
+├── .gitlab-ci.yml                    builds & pushes the image on every push to main
+├── requirements.txt                  httpx, markdown-it-py (both public PyPI)
+└── src/sync_athena/
+    ├── __init__.py
+    ├── athena_client.py              thin sync HTTP client
+    ├── markdown_to_blocknote.py      markdown -> BlockNote JSON converter
+    ├── tickets.py                    ticket keys, GitHub ref parsing, duplicate detection
+    ├── collaborators.py              additive, verified editor / co-author assignment
+    ├── issue_to_task.py              entrypoint: GitHub issue -> Athena task (idempotent)
+    ├── comment_to_task.py            entrypoint: GitHub issue/PR comment -> task child
+    └── pr_to_comment.py              entrypoint: PR -> solution child linking the PR
 ```
 
 ## Required secrets and variables
@@ -46,6 +62,8 @@ shows placeholders.
 | variable | `ATHENA_DB_PATH` | `project/proj_<uuid>.db` |
 | variable | `ATHENA_EDITORS` (optional) | `alice@x.com,bob@x.com` — editors set on every task this action creates |
 | variable | `ATHENA_CO_AUTHORS` (optional) | same shape, co-author role |
+| variable | `SYNC_ATHENA_REGISTRY_USERNAME` | username for `docker login` to `gitlab.espressif.cn:5050` |
+| secret | `SYNC_ATHENA_REGISTRY_TOKEN` | a GitLab deploy token / project access token scoped to `read_registry` on `idf/sync-athena` |
 
 Create the bot token once with cookie auth (run interactively on any host
 that has the Athena CLI installed — the `athena login` command picks up the
@@ -221,15 +239,16 @@ Bare usernames are expanded against the optional `email_domain` input, so
 - Any Athena API error → `::warning::` + exit 0. Workflow never fails.
 - Existing task found → updated in place, never duplicated.
 - Missing `ATHENA_*` env → `::error::` + exit 1 (configuration error, not a runtime one).
-- `gh` missing on the runner → comment/label step logs a warning; the
-  Athena write still succeeds.
+- `gh` is baked into the sync-athena image; if a future image build drops it,
+  the comment/label step logs a warning and the Athena write still succeeds.
 - Collaborator failures → `::warning::` naming the address and reason; the
   ticket is still created.
 
 ## Inputs
 
 The composite action exposes these inputs. All Athena secrets are forwarded
-verbatim to the underlying Python entrypoint.
+as environment variables into the `docker run` that executes the underlying
+Python entrypoint.
 
 | input | required | default | notes |
 | --- | --- | --- | --- |
@@ -246,6 +265,16 @@ verbatim to the underlying Python entrypoint.
 | `athena_base_url` | yes (via env) | – | Athena server URL |
 | `athena_project_uuid` | yes (via env) | – | project UUID |
 | `athena_db_path` | yes (via env) | – | `project/proj_<uuid>.db` |
+| `registry_username` | yes | – | username for `docker login` to the internal registry |
+| `registry_token` | yes | – | password/token for `docker login`; pass from a secret |
+| `registry` | no | `gitlab.espressif.cn:5050` | internal Docker registry host |
+| `image` | no | `gitlab.espressif.cn:5050/idf/sync-athena` | registry path of the built image |
+| `image_tag` | no | `latest` | image tag to pull |
+
+The GitHub Actions runner needs network access to the internal registry —
+this only runs on runners that can reach `gitlab.espressif.cn:5050`
+(self-hosted / VPN-connected runners), not on public GitHub-hosted runners
+without additional network access.
 
 ## Adoption: per-team config
 
@@ -264,6 +293,8 @@ secrets/variables; the workflow file stays unchanged.
     athena_db_path: ${{ vars.ATHENA_DB_PATH }}
     athena_base_url: ${{ secrets.ATHENA_BASE_URL }}
     athena_token: ${{ secrets.ATHENA_TOKEN }}
+    registry_username: ${{ vars.SYNC_ATHENA_REGISTRY_USERNAME }}
+    registry_token: ${{ secrets.SYNC_ATHENA_REGISTRY_TOKEN }}
 ```
 
 `ATHENA_TICKET_PREFIX` is intentionally required with no default. If a team

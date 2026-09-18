@@ -22,3 +22,5 @@ jobs:
           athena_db_path: ${{ vars.ATHENA_DB_PATH }}
           athena_base_url: ${{ secrets.ATHENA_BASE_URL }}
           athena_token: ${{ secrets.ATHENA_TOKEN }}
+          registry_username: ${{ vars.SYNC_ATHENA_REGISTRY_USERNAME }}
+          registry_token: ${{ secrets.SYNC_ATHENA_REGISTRY_TOKEN }}

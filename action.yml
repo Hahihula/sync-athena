@@ -1,5 +1,5 @@
 name: "Sync to Athena"
-description: "Bidirectional GitHub <-> Athena sync: create tickets from issues, link PRs to their matching task, append comments as child notes."
+description: "Bidirectional GitHub <-> Athena sync: create tickets from issues, link PRs to their matching task, append comments as child notes. Runs the sync-athena image built by the internal GitLab pipeline."
 author: "hahihula"
 
 inputs:
@@ -37,8 +37,7 @@ inputs:
     description: >
       Token for the gh CLI calls that comment on and label the issue, and that read
       issue titles during a backfill. Defaults to the workflow's own GITHUB_TOKEN;
-      the calling job needs `permissions: issues: write`. Composite-action steps do
-      not inherit GITHUB_TOKEN automatically — without this, gh exits 4.
+      the calling job needs `permissions: issues: write`.
     required: false
     default: ${{ github.token }}
   event_path:
@@ -69,27 +68,54 @@ inputs:
     description: "Domain used to expand bare usernames in 'editors'/'co_authors' (e.g. 'espressif.com'). Entries already containing '@' are left alone."
     required: false
     default: ""
+  registry:
+    description: "Internal Docker registry hosting the sync-athena image."
+    required: false
+    default: "gitlab.espressif.cn:5050"
+  image:
+    description: "Registry path of the sync-athena image, without tag. Built by the idf/sync-athena GitLab pipeline."
+    required: false
+    default: "gitlab.espressif.cn:5050/idf/sync-athena"
+  image_tag:
+    description: "Tag of the sync-athena image to pull."
+    required: false
+    default: "latest"
+  registry_username:
+    description: "Username for docker login to the internal registry."
+    required: true
+  registry_token:
+    description: "Token/password for docker login to the internal registry. Pass this from a secret — never hardcode it in a workflow file."
+    required: true
 
 runs:
   using: "composite"
   steps:
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-
-    - name: Install dependencies
-      shell: bash
-      run: |
-        python -m pip install --upgrade pip
-        pip install httpx>=0.27 markdown-it-py>=3.0
-        # Action source is vendored alongside the workflow; PYTHONPATH picks it up.
-        echo "PYTHONPATH=${GITHUB_ACTION_PATH}/src${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
-
-    - name: Sync issue -> Athena task
-      if: inputs.mode == 'issue_to_task'
+    - name: Log in to internal registry
       shell: bash
       env:
+        _REGISTRY: ${{ inputs.registry }}
+        _USERNAME: ${{ inputs.registry_username }}
+        _TOKEN: ${{ inputs.registry_token }}
+      run: echo "$_TOKEN" | docker login "$_REGISTRY" --username "$_USERNAME" --password-stdin
+
+    - name: Pull sync-athena image
+      shell: bash
+      env:
+        _IMAGE: ${{ inputs.image }}
+        _TAG: ${{ inputs.image_tag }}
+      run: docker pull "${_IMAGE}:${_TAG}"
+
+    - name: Run sync-athena
+      shell: bash
+      env:
+        _IMAGE: ${{ inputs.image }}
+        _TAG: ${{ inputs.image_tag }}
+        MODE: ${{ inputs.mode }}
+        REPO: ${{ inputs.repo }}
+        EVENT_PATH: ${{ inputs.event_path }}
+        ISSUE_NUMBER: ${{ inputs.issue_number }}
+        ISSUE_TITLE: ${{ inputs.issue_title }}
+        ISSUE_BODY: ${{ inputs.issue_body }}
         ATHENA_PROJECT_UUID: ${{ inputs.athena_project_uuid }}
         ATHENA_DB_PATH: ${{ inputs.athena_db_path }}
         ATHENA_BASE_URL: ${{ inputs.athena_base_url }}
@@ -101,49 +127,17 @@ runs:
         ATHENA_CO_AUTHORS: ${{ inputs.co_authors }}
         ATHENA_EMAIL_DOMAIN: ${{ inputs.email_domain }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
-        _REPO: ${{ inputs.repo }}
-        _EVENT_PATH: ${{ inputs.event_path }}
-        _ISSUE_NUMBER: ${{ inputs.issue_number }}
-        _ISSUE_TITLE: ${{ inputs.issue_title }}
-        _ISSUE_BODY: ${{ inputs.issue_body }}
       run: |
-        args=(--repo "$_REPO")
-        [ -n "$_EVENT_PATH" ] && args+=(--event "$_EVENT_PATH")
-        [ -n "$_ISSUE_NUMBER" ] && args+=(--issue-number "$_ISSUE_NUMBER")
-        [ -n "$_ISSUE_TITLE" ] && args+=(--issue-title "$_ISSUE_TITLE")
-        [ -n "$_ISSUE_BODY" ] && args+=(--issue-body "$_ISSUE_BODY")
-        python -m sync_athena.issue_to_task "${args[@]}"
-
-    - name: Sync comment -> Athena task
-      if: inputs.mode == 'comment_to_task'
-      shell: bash
-      env:
-        ATHENA_PROJECT_UUID: ${{ inputs.athena_project_uuid }}
-        ATHENA_DB_PATH: ${{ inputs.athena_db_path }}
-        ATHENA_BASE_URL: ${{ inputs.athena_base_url }}
-        ATHENA_TOKEN: ${{ inputs.athena_token }}
-        ATHENA_TICKET_PREFIX: ${{ inputs.ticket_prefix }}
-        ATHENA_TASKS_FOLDER: ${{ inputs.tasks_folder }}
-        ATHENA_AUTHOR: ${{ inputs.author }}
-        _EVENT_PATH: ${{ inputs.event_path }}
-      run: |
-        args=()
-        [ -n "$_EVENT_PATH" ] && args+=(--event "$_EVENT_PATH")
-        python -m sync_athena.comment_to_task "${args[@]}"
-
-    - name: Sync PR -> Athena comment
-      if: inputs.mode == 'pr_to_comment'
-      shell: bash
-      env:
-        ATHENA_PROJECT_UUID: ${{ inputs.athena_project_uuid }}
-        ATHENA_DB_PATH: ${{ inputs.athena_db_path }}
-        ATHENA_BASE_URL: ${{ inputs.athena_base_url }}
-        ATHENA_TOKEN: ${{ inputs.athena_token }}
-        ATHENA_TICKET_PREFIX: ${{ inputs.ticket_prefix }}
-        ATHENA_TASKS_FOLDER: ${{ inputs.tasks_folder }}
-        ATHENA_AUTHOR: ${{ inputs.author }}
-        _EVENT_PATH: ${{ inputs.event_path }}
-      run: |
-        args=()
-        [ -n "$_EVENT_PATH" ] && args+=(--event "$_EVENT_PATH")
-        python -m sync_athena.pr_to_comment "${args[@]}"
+        # EVENT_PATH defaults to $GITHUB_EVENT_PATH; both it and $GITHUB_OUTPUT
+        # live under $RUNNER_TEMP, which is bind-mounted below so the container
+        # sees them at the same host paths.
+        [ -z "$EVENT_PATH" ] && EVENT_PATH="$GITHUB_EVENT_PATH"
+        docker run --rm \
+          -v "${RUNNER_TEMP}:${RUNNER_TEMP}" \
+          -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" \
+          -e MODE -e REPO -e EVENT_PATH -e ISSUE_NUMBER -e ISSUE_TITLE -e ISSUE_BODY \
+          -e ATHENA_PROJECT_UUID -e ATHENA_DB_PATH -e ATHENA_BASE_URL -e ATHENA_TOKEN \
+          -e ATHENA_TICKET_PREFIX -e ATHENA_TASKS_FOLDER -e ATHENA_AUTHOR \
+          -e ATHENA_EDITORS -e ATHENA_CO_AUTHORS -e ATHENA_EMAIL_DOMAIN \
+          -e GITHUB_TOKEN -e GITHUB_OUTPUT \
+          "${_IMAGE}:${_TAG}"
