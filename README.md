@@ -173,7 +173,7 @@ workflow_dispatch:
 ```
 
 ```yaml
-- uses: hahihula/sync-athena@v1
+- uses: hahihula/sync-athena@v2
   with:
     mode: issue_to_task
     issue_number: ${{ inputs.issue-numbers }}   # must be wired through
@@ -284,7 +284,7 @@ secrets/variables; the workflow file stays unchanged.
 
 ```yaml
 # another-team/.github/workflows/sync-athena.yml
-- uses: hahihula/sync-athena@v1
+- uses: hahihula/sync-athena@v2
   with:
     mode: issue_to_task
     repo: ${{ github.repository }}
